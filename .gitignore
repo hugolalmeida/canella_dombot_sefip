@@ -1,0 +1,19 @@
+# Token de máquina da Conectividade Social (JWS RS256, aud=SEFIP).
+# É CREDENCIAL: quem tiver este arquivo pode se passar por uma máquina
+# cadastrada da empresa. Nunca versionar.
+token_maquina.json
+
+# Artefatos de diagnóstico do Bot_Conectividade (--debug): screenshots, dumps
+# de HTML e trace.zip podem conter dados da Caixa Postal e da sessão.
+debug_conectividade/
+
+# Bytecode e logs
+__pycache__/
+*.pyc
+logs/
+
+# Saídas por empresa: .re/.SFP gerados e protocolos assinados pela Caixa
+# (dados fiscais reais de clientes — CNPJ, folha, selo digital). Nunca versionar.
+results/
+/0*/
+

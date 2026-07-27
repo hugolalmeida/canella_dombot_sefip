@@ -30,6 +30,44 @@ from pywinauto.keyboard import send_keys
 from pywinauto import findwindows, timings
 import win32gui
 import win32con
+import win32process
+from ctypes import wintypes
+
+
+def _hwnd_com_foco_teclado() -> int:
+    """
+    Retorna o hwnd do controle que realmente possui o foco de teclado no
+    momento, via GetGUIThreadInfo (funciona entre processos, diferente de
+    GetFocus() puro que só enxerga a thread chamadora). Usado para confirmar
+    que send_keys vai atingir o controle esperado antes de digitar texto
+    livre — evita que letras "vazem" como atalhos de tela quando o foco
+    real está em outro lugar (ex: fora de qualquer campo de texto).
+    """
+    hwnd_fg = win32gui.GetForegroundWindow()
+    if not hwnd_fg:
+        return 0
+    tid, _ = win32process.GetWindowThreadProcessId(hwnd_fg)
+
+    class GUITHREADINFO(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.DWORD),
+            ("flags", wintypes.DWORD),
+            ("hwndActive", wintypes.HWND),
+            ("hwndFocus", wintypes.HWND),
+            ("hwndCapture", wintypes.HWND),
+            ("hwndMenuOwner", wintypes.HWND),
+            ("hwndMoveSize", wintypes.HWND),
+            ("hwndCaret", wintypes.HWND),
+            ("rcCaret", wintypes.RECT),
+        ]
+
+    info = GUITHREADINFO()
+    info.cbSize = ctypes.sizeof(GUITHREADINFO)
+    ok = ctypes.windll.user32.GetGUIThreadInfo(tid, ctypes.byref(info))
+    if not ok:
+        return 0
+    return int(info.hwndFocus) if info.hwndFocus else 0
+
 
 # Imports de GUI — só disponíveis quando rodando com ambiente desktop completo
 try:
@@ -613,6 +651,37 @@ class GFIPAutomation:
         except Exception:
             pass
 
+    def _set_focus_cross_process(self, hwnd: int) -> bool:
+        """
+        Dá foco de teclado a um controle de outro processo (ex: o Domínio).
+        win32gui.SetFocus falha com ERROR_ACCESS_DENIED (5) quando chamado
+        pela thread do Python diretamente, pois SetFocus só é permitido para
+        a thread dona da fila de mensagens da janela alvo. A solução padrão
+        do Win32 é anexar temporariamente a thread do Python à thread de
+        input do processo alvo via AttachThreadInput, chamar SetFocus, e
+        desanexar em seguida.
+        """
+        user32 = ctypes.windll.user32
+        hwnd_fg = win32gui.GetForegroundWindow()
+        tid_alvo, _ = win32process.GetWindowThreadProcessId(hwnd_fg) if hwnd_fg else (0, 0)
+        tid_atual = ctypes.windll.kernel32.GetCurrentThreadId()
+
+        anexado = False
+        try:
+            if tid_alvo and tid_alvo != tid_atual:
+                anexado = bool(user32.AttachThreadInput(tid_atual, tid_alvo, True))
+            win32gui.SetFocus(hwnd)
+            return True
+        except Exception as e:
+            self.log(f"⚠️ SetFocus cross-process falhou: {e}")
+            return False
+        finally:
+            if anexado:
+                try:
+                    user32.AttachThreadInput(tid_atual, tid_alvo, False)
+                except Exception:
+                    pass
+
     def _is_alive(self) -> bool:
         if not self.app or not self.main_window:
             return False
@@ -635,6 +704,32 @@ class GFIPAutomation:
             return True
         win32gui.EnumWindows(cb, None)
         return result[0]
+
+    def _get_combobox_text_by_ctrl_id(self, parent_hwnd: int, ctrl_id: int) -> str:
+        """
+        Lê o texto atualmente exibido em um ComboBox filho identificado por
+        ctrl_id, usando WM_GETTEXT via SendMessageW (ctypes). WM_GETTEXT é
+        uma das mensagens com marshalling cross-process garantido pelo
+        Windows (ao contrário de CB_GETLBTEXT, cujo buffer de saída não é
+        thunked entre processos e retornava lixo/vazio na tentativa
+        anterior via win32gui.GetWindowText/SendMessage).
+        """
+        WM_GETTEXT     = 0x000D
+        WM_GETTEXTLENGTH = 0x000E
+        user32 = ctypes.windll.user32
+
+        h = win32gui.GetWindow(parent_hwnd, 5)  # GW_CHILD
+        while h:
+            try:
+                if win32gui.GetDlgCtrlID(h) == ctrl_id and win32gui.GetClassName(h) == "ComboBox":
+                    length = user32.SendMessageW(h, WM_GETTEXTLENGTH, 0, 0)
+                    buf = ctypes.create_unicode_buffer(length + 1)
+                    user32.SendMessageW(h, WM_GETTEXT, length + 1, ctypes.byref(buf))
+                    return buf.value or ""
+            except Exception:
+                pass
+            h = win32gui.GetWindow(h, 2)  # GW_HWNDNEXT
+        return ""
 
     # ── Conexão ──────────────────────────────────────────────────────────────
 
@@ -780,7 +875,35 @@ class GFIPAutomation:
             if not self.smart_sleep(2):
                 return False
 
-            self._fechar_avisos_vencimento()
+            # Aguarda a janela "Troca de empresas" fechar de fato — sinal de
+            # que o Domínio concluiu o carregamento da empresa. Só depois
+            # disso é seguro checar/fechar o aviso de vencimento e navegar
+            # pelo menu; fazer isso cedo demais faz o menu ser processado
+            # ainda com a troca em andamento, e o aviso "rouba" o Enter.
+            self.log("⏳ Aguardando o Domínio concluir a troca de empresa...")
+            troca_fechou = False
+            for _ in range(20):
+                if self.should_stop():
+                    return False
+                try:
+                    troca_check = self.main_window.child_window(title="Troca de empresas", class_name="FNWND3190")
+                    if not troca_check.exists():
+                        troca_fechou = True
+                        break
+                except Exception:
+                    troca_fechou = True
+                    break
+                if not self.smart_sleep(0.5):
+                    return False
+
+            if not troca_fechou:
+                self.log("⚠️ Janela 'Troca de empresas' ainda visível após espera — prosseguindo com cautela")
+
+            # Tempo extra para o aviso de vencimento (se houver) terminar de
+            # renderizar antes de tentarmos fechá-lo/navegar pelo menu.
+            if not self.smart_sleep(2):
+                return False
+            self._garantir_aviso_vencimento_fechado()
             self.empresa_atual = empresa_num
             self.log(f"✅ Empresa {empresa_num} ativa")
             return True
@@ -794,9 +917,10 @@ class GFIPAutomation:
         """Fecha popup de Avisos de Vencimento — busca como filho e como top-level."""
         fechou = False
 
-        # 1. Tenta como filho da janela principal
+        # 1. Tenta como filho da janela principal (título real observado:
+        # "Relatório de Avisos de Vencimentos" — por isso regex, não exato)
         try:
-            av = self.main_window.child_window(title="Avisos de Vencimento", class_name="FNWND3190")
+            av = self.main_window.child_window(title_re=".*[Vv]enciment.*", class_name="FNWND3190")
             if av.exists() and av.is_visible():
                 self.log("🔔 Fechando Avisos de Vencimento (filho)")
                 av.set_focus()
@@ -898,10 +1022,68 @@ class GFIPAutomation:
 
     # ── Navegação: Relatórios → Informativos → (seta) → (seta) → Enter ──────
 
+    def _aviso_vencimento_aberto(self) -> bool:
+        """Verifica (sem fechar) se a janela/aba 'Avisos de Vencimento(s)' está aberta.
+        Usa busca por substring pois o título observado no sistema real é
+        'Relatório de Avisos de Vencimentos' (plural, com prefixo), não o
+        texto exato 'Avisos de Vencimento'.
+
+        O aviso abre EMBUTIDO como aba/filho da janela principal (mesmo
+        padrão do relatório GFIP e do antigo 'Extrator da DIRF'), não como
+        janela top-level — por isso EnumWindows sozinho não o enxerga.
+        Verificamos: 1) o título da própria main_window, 2) filhos diretos
+        FNWND3190 da main_window, 3) fallback top-level via EnumWindows.
+        """
+        try:
+            titulo_main = self.main_window.window_text() or ""
+            if "venciment" in titulo_main.lower():
+                return True
+        except Exception:
+            pass
+
+        try:
+            av = self.main_window.child_window(title_re=".*[Vv]enciment.*", class_name="FNWND3190")
+            if av.exists() and av.is_visible():
+                return True
+        except Exception:
+            pass
+
+        encontrado = [False]
+        def _cb(hwnd, _):
+            if encontrado[0]:
+                return
+            try:
+                if not win32gui.IsWindowVisible(hwnd):
+                    return
+                if "venciment" in win32gui.GetWindowText(hwnd).lower():
+                    encontrado[0] = True
+            except Exception:
+                pass
+        try:
+            win32gui.EnumWindows(_cb, None)
+        except Exception:
+            pass
+        return encontrado[0]
+
+    def _garantir_aviso_vencimento_fechado(self, tentativas: int = 6) -> bool:
+        """Fecha repetidamente o aviso de vencimento (aparece com atraso após
+        a troca de empresa) até confirmar que não está mais aberto. Deve ser
+        chamado logo antes de qualquer navegação de menu, pois se essa janela
+        ainda estiver aberta um ENTER subsequente a maximiza em vez de
+        confirmar o menu."""
+        for _ in range(tentativas):
+            if not self._aviso_vencimento_aberto():
+                return True
+            self.log("🔔 'Avisos de Vencimento' ainda aberto — fechando antes de navegar")
+            self._fechar_avisos_vencimento()
+            time.sleep(0.4)
+        return not self._aviso_vencimento_aberto()
+
     def abrir_extrator_gfip(self) -> bool:
         try:
             self.log("📂 Abrindo relatório GFIP...")
-            self._fechar_avisos_vencimento()
+            if not self._garantir_aviso_vencimento_fechado():
+                self.log("⚠️ Não foi possível confirmar o fechamento do 'Avisos de Vencimento' — prosseguindo com cautela")
             self.main_window.set_focus()
             if not self.smart_sleep(0.4):
                 return False
@@ -918,6 +1100,30 @@ class GFIPAutomation:
             send_keys('{RIGHT}')      # → entra no item/submenu seguinte
             if not self.smart_sleep(0.4):
                 return False
+
+            # Última checagem: se o aviso "roubou" o foco durante a navegação
+            # do menu, o ENTER a seguir iria apenas maximizá-lo em vez de
+            # confirmar a seleção do GFIP.
+            if self._aviso_vencimento_aberto():
+                self.log("⚠️ 'Avisos de Vencimento' reapareceu durante a navegação — fechando e reiniciando menu")
+                self._fechar_avisos_vencimento()
+                time.sleep(0.4)
+                self.main_window.set_focus()
+                if not self.smart_sleep(0.4):
+                    return False
+                send_keys('%r')
+                if not self.smart_sleep(0.5):
+                    return False
+                send_keys('i')
+                if not self.smart_sleep(0.4):
+                    return False
+                send_keys('{RIGHT}')
+                if not self.smart_sleep(0.4):
+                    return False
+                send_keys('{RIGHT}')
+                if not self.smart_sleep(0.4):
+                    return False
+
             send_keys('{ENTER}')      # ENTER — abre a janela do GFIP
             if not self.smart_sleep(1.5):
                 return False
@@ -961,13 +1167,99 @@ class GFIPAutomation:
 
     # ── Preenche a janela do GFIP e clica OK ─────────────────────────────────
 
-    def preencher_gfip(self, comp_inicial: str, comp_final: str,
-                       cod_recolhimento: str, caminho_completo: str) -> bool:
+    def _achar_filho_por_ctrl_id(self, parent_hwnd: int, ctrl_id: int, classe: str = None) -> int:
+        """Retorna hwnd do filho direto com o ctrl_id (e classe, se informada) dados."""
+        h = win32gui.GetWindow(parent_hwnd, 5)  # GW_CHILD
+        while h:
+            try:
+                if win32gui.GetDlgCtrlID(h) == ctrl_id:
+                    if classe is None or win32gui.GetClassName(h) == classe:
+                        return h
+            except Exception:
+                pass
+            h = win32gui.GetWindow(h, 2)  # GW_HWNDNEXT
+        return 0
+
+    def _marcar_fgts_em_atraso(self, extrator_hwnd: int, data_atraso: str) -> bool:
         """
-        Preenche competência inicial/final, código de recolhimento e caminho
-        de destino, então confirma (OK). A janela abre com foco no campo
-        "Competência de:" e a ordem de TAB é:
-        Competência de → até → Código de Recolhimento → Caminho → OK.
+        Marca o combo "Indicador recolhimento do FGTS" (ctrl_id=1034) como
+        "Em Atraso" e preenche o campo "Data" (ctrl_id=1027, PBEDIT190) com
+        `data_atraso` (DD/MM/AAAA). Mapeado via gfip_tab_spy.py.
+
+        O combo 1034 é um ComboBox nativo do Win32 (não VCL) — usamos
+        CB_GETCOUNT/CB_GETLBTEXT via SendMessageW para achar o índice do
+        item "Em Atraso" e CB_SETCURSEL para selecioná-lo, técnica mais
+        confiável que ciclar por tecla (usado no combo 1024, que é custom).
+        """
+        CB_GETCOUNT   = 0x0146
+        CB_GETLBTEXT  = 0x0148
+        CB_GETLBTEXTLEN = 0x0149
+        CB_SETCURSEL  = 0x014E
+        CB_GETCURSEL  = 0x0147
+        user32 = ctypes.windll.user32
+
+        combo_hwnd = self._achar_filho_por_ctrl_id(extrator_hwnd, 1034, "ComboBox")
+        if not combo_hwnd:
+            self.log("❌ Combo 'Indicador recolhimento do FGTS' (ctrl_id=1034) não encontrado")
+            return False
+
+        count = user32.SendMessageW(combo_hwnd, CB_GETCOUNT, 0, 0)
+        indice_atraso = -1
+        for i in range(count):
+            length = user32.SendMessageW(combo_hwnd, CB_GETLBTEXTLEN, i, 0)
+            buf = ctypes.create_unicode_buffer(length + 1)
+            user32.SendMessageW(combo_hwnd, CB_GETLBTEXT, i, ctypes.byref(buf))
+            if "atraso" in (buf.value or "").strip().lower():
+                indice_atraso = i
+                break
+
+        if indice_atraso < 0:
+            self.log(f"❌ Item 'Em Atraso' não encontrado no combo 1034 ({count} itens)")
+            return False
+
+        user32.SendMessageW(combo_hwnd, CB_SETCURSEL, indice_atraso, 0)
+        # ComboBox nativo não notifica o app sozinho via SendMessage direto;
+        # o Domínio só reage à mudança (habilitando o campo Data) ao receber
+        # WM_COMMAND/CBN_SELCHANGE do combo para a janela pai.
+        CBN_SELCHANGE = 1
+        parent_id = win32gui.GetDlgCtrlID(combo_hwnd)
+        wparam = (CBN_SELCHANGE << 16) | parent_id
+        win32gui.SendMessage(extrator_hwnd, win32con.WM_COMMAND, wparam, combo_hwnd)
+        time.sleep(0.3)
+        self.log("📝 Indicador recolhimento do FGTS: Em Atraso")
+
+        data_hwnd = self._achar_filho_por_ctrl_id(extrator_hwnd, 1027, "PBEDIT190")
+        if not data_hwnd:
+            self.log("❌ Campo Data (ctrl_id=1027) não encontrado após marcar Em Atraso")
+            return False
+
+        self._set_focus_cross_process(data_hwnd)
+        time.sleep(0.2)
+        send_keys('^a')
+        time.sleep(0.1)
+        send_keys(data_atraso, with_spaces=False)
+        time.sleep(0.2)
+        self.log(f"📝 Data do FGTS em atraso: {data_atraso}")
+        return True
+
+    def preencher_gfip(self, comp_inicial: str, comp_final: str,
+                       cod_recolhimento: str, caminho_completo: str,
+                       data_atraso: str = None) -> bool:
+        """
+        Preenche competência, código de recolhimento e caminho de destino,
+        então confirma (OK). A janela abre com foco no campo "Competência"
+        (único — não há "de"/"até" nesta tela; comp_final é aceito por
+        compatibilidade com o restante do fluxo mas não é usado aqui).
+        Ordem de TAB confirmada na tela real:
+        Competência → Código de Recolhimento → (5x TAB) → Caminho → OK.
+
+        `data_atraso`: se informado (formato DD/MM/AAAA), marca o combo
+        "Indicador recolhimento do FGTS" (ctrl_id=1034) como "Em Atraso" e
+        preenche o campo "Data" correspondente (ctrl_id=1027) com esse valor.
+        Usado no fluxo de recálculo de FGTS, que sempre envolve recolhimento
+        em atraso. Se None, o indicador permanece no padrão "No Prazo" da
+        tela (comportamento normal do GFIP). O indicador de Previdência
+        Social (2º par de campos) não é alterado — fora do escopo atual.
 
         O Domínio grava o TXT diretamente no caminho informado, com nome de
         arquivo fixo definido pelo próprio sistema — por isso o caminho deve
@@ -990,55 +1282,178 @@ class GFIPAutomation:
 
             self._force_focus(extrator_hwnd)
             time.sleep(0.5)
-            self.log(f"📝 Preenchendo competência: {comp_inicial} — {comp_final}")
+            self.log(f"📝 Preenchendo competência: {comp_inicial}")
 
-            # Campo "Competência de:" já vem focado ao abrir a janela
+            # Campo "Competência" (único, não há "de"/"até" nesta tela) já
+            # vem focado ao abrir a janela.
             send_keys('^a')
             time.sleep(0.1)
             send_keys(comp_inicial, with_spaces=False)
             time.sleep(0.3)
 
-            # TAB — campo "até:" (competência final)
+            # TAB — Código de Recolhimento (combo, ex: "115 - Fgts + Inss").
+            # O combo já abre com "115" selecionado por padrão. Este combo
+            # NÃO é navegado por F4/setas: com foco nele, apertar a tecla
+            # "1" repetidamente cicla entre os itens que começam com "1"
+            # (115 -> 150 -> 155 -> 115 -> ...), sem precisar abrir dropdown
+            # nem confirmar com Enter — o valor exibido já fica setado.
+            send_keys('{TAB}')
+            time.sleep(0.2)
+            cod_recolhimento_norm = (cod_recolhimento or "").strip()
+            if not cod_recolhimento_norm or cod_recolhimento_norm.startswith("115"):
+                self.log("📝 Código de Recolhimento: 115 (padrão da tela, não alterado)")
+            else:
+                self.log(f"📝 Código de Recolhimento: selecionando {cod_recolhimento_norm} via ciclo de tecla")
+                achou = False
+                item_atual = self._get_combobox_text_by_ctrl_id(extrator_hwnd, 1024)
+                self.log(f"   valor inicial do combo: '{item_atual.strip()}'")
+                for i in range(6):  # só 3 itens no ciclo (115/150/155); 6 dá folga
+                    if item_atual.strip().startswith(cod_recolhimento_norm):
+                        achou = True
+                        break
+                    send_keys('1', with_spaces=False)
+                    time.sleep(0.5)
+                    item_atual = self._get_combobox_text_by_ctrl_id(extrator_hwnd, 1024)
+                    self.log(f"   após aperto {i+1}: '{item_atual.strip()}'")
+                if achou:
+                    self.log(f"📝 Código de Recolhimento: {item_atual.strip()}")
+                else:
+                    self.log(f"❌ Item '{cod_recolhimento_norm}' não encontrado ciclando o combo de Recolhimento após 6 tentativas — abortando linha (valor atual: '{item_atual.strip()}')")
+                    return False
+
+            # Ordem de TAB confirmada via gfip_tab_spy.py (ctrl_id de cada
+            # controle focado, a partir de Competência ctrl_id=1037):
+            #   1024 ComboBox (Recolhimento) -> 1047 ComboBox (Característica)
+            #   -> 1050 ComboBox -> 1001 PBEDIT190 (Responsável)
+            #   -> 2 Button "&Arquivo" (radio) -> 1014 Button "..."
+            #   -> 1025 Edit (campo de caminho real)
+
+            # TAB — Característica (não alterado)
+            send_keys('{TAB}')
+            time.sleep(0.15)
+            # TAB — próximo combo (Tipo Folha/Complemento/Modalidade — não alterado)
+            send_keys('{TAB}')
+            time.sleep(0.15)
+
+            # TAB — Responsável (ctrl_id=1001, preenchido com "1")
             send_keys('{TAB}')
             time.sleep(0.2)
             send_keys('^a')
             time.sleep(0.1)
-            send_keys(comp_final, with_spaces=False)
+            send_keys('1', with_spaces=False)
             time.sleep(0.3)
+            self.log("📝 Responsável: 1")
 
-            # TAB — Código de Recolhimento
-            send_keys('{TAB}')
-            time.sleep(0.2)
-            if cod_recolhimento:
-                send_keys('^a')
-                time.sleep(0.1)
-                send_keys(cod_recolhimento, with_spaces=False)
-                time.sleep(0.3)
-                self.log(f"📝 Código de Recolhimento: {cod_recolhimento}")
-            else:
-                self.log("ℹ️ Código de Recolhimento não informado na planilha — mantendo valor padrão da tela")
+            # Campo de caminho real (ctrl_id=1025, Edit). Em vez de confiar
+            # cegamente em mais TABs (se algum passo anterior desviar, uma
+            # letra do caminho digitada fora de um campo de texto é
+            # interpretada como atalho de tela — ex: "S" de "Santos" abrindo
+            # "Seleção..."), localizamos e focamos esse Edit diretamente
+            # pelo ctrl_id via win32gui, o que é imune a desvios de TAB.
+            caminho_hwnd = 0
+            h = win32gui.GetWindow(extrator_hwnd, 5)  # GW_CHILD
+            while h:
+                try:
+                    if win32gui.GetDlgCtrlID(h) == 1025 and win32gui.GetClassName(h) == "Edit":
+                        caminho_hwnd = h
+                        break
+                except Exception:
+                    pass
+                h = win32gui.GetWindow(h, 2)  # GW_HWNDNEXT
 
-            # TAB — Caminho do arquivo de destino
-            send_keys('{TAB}')
+            if not caminho_hwnd:
+                self.log("❌ Campo de caminho (ctrl_id=1025) não encontrado — abortando linha")
+                return False
+
+            # win32gui.SetFocus só funciona quando chamado pela thread dona
+            # da fila de mensagens da janela alvo — daí o "Acesso negado"
+            # (ERROR_ACCESS_DENIED) ao tentar focar um controle de outro
+            # processo diretamente. É preciso anexar a thread do Python à
+            # thread de input do Domínio via AttachThreadInput antes de
+            # chamar SetFocus, e desanexar logo em seguida.
+            self._set_focus_cross_process(caminho_hwnd)
             time.sleep(0.2)
-            send_keys('^a')
+
+            # Confirma que o foco realmente chegou no campo certo antes de
+            # digitar — evita repetir o bug de letras vazando como atalho.
+            foco_ok = False
+            for _ in range(10):
+                foco_atual = _hwnd_com_foco_teclado()
+                if foco_atual == caminho_hwnd:
+                    foco_ok = True
+                    break
+                self._set_focus_cross_process(caminho_hwnd)
+                time.sleep(0.2)
+
+            if not foco_ok:
+                self.log("❌ Não foi possível focar o campo de caminho — abortando linha para evitar digitar teclas soltas")
+                return False
+
+            # Este campo já vem preenchido com um caminho padrão do Domínio;
+            # Ctrl+A não seleciona/limpa esse Edit de forma confiável, então
+            # limpamos explicitamente via WM_SETTEXT (substituição direta,
+            # sem depender de seleção por teclado) e então digitamos.
+            win32gui.SendMessage(caminho_hwnd, win32con.WM_SETTEXT, 0, "")
             time.sleep(0.1)
             send_keys(caminho_completo, with_spaces=True)
             time.sleep(0.3)
             self.log(f"📁 Caminho de destino: {caminho_completo}")
 
-            # Confirma (OK) — ENTER na própria janela grava o arquivo direto
+            # Indicador recolhimento do FGTS "Em Atraso" + Data (fluxo de
+            # recálculo de FGTS). Localizado por ctrl_id via
+            # gfip_tab_spy.py: 1034 = ComboBox indicador, 1027 = PBEDIT190 Data.
+            if data_atraso:
+                if not self._marcar_fgts_em_atraso(extrator_hwnd, data_atraso):
+                    self.log("❌ Não foi possível marcar 'Em Atraso' — abortando linha")
+                    return False
+
+            # Confirma (OK). Botão real inspecionado: AutomationId="1028" (ctrl_id),
+            # AccessKey="Alt+o", class="Button". ENTER sozinho não aciona esse botão
+            # pois o foco pode estar no campo de caminho, não no botão — por isso
+            # localizamos o botão pelo ctrl_id e clicamos via PostMessage (mesma
+            # técnica que funciona no DIRF), com fallback Alt+O e ENTER.
             self.log("▶ Confirmando (OK)...")
-            send_keys('{ENTER}')
+            BM_CLICK = 0x00F5
+            ok_hwnd = 0
+            h = win32gui.GetWindow(extrator_hwnd, 5)  # GW_CHILD
+            while h:
+                try:
+                    if win32gui.GetDlgCtrlID(h) == 1028 and win32gui.GetClassName(h) == "Button":
+                        ok_hwnd = h
+                        break
+                except Exception:
+                    pass
+                h = win32gui.GetWindow(h, 2)  # GW_HWNDNEXT
+
+            if ok_hwnd:
+                win32gui.PostMessage(ok_hwnd, BM_CLICK, 0, 0)
+                self.log("✅ OK clicado (PostMessage, ctrl_id=1028)")
+            else:
+                self.log("⚠️ Botão OK não encontrado por ID, usando Alt+O")
+                send_keys('%o')
+                time.sleep(0.3)
+                send_keys('{ENTER}')
+
+            # O popup de confirmação ("GFIP gerada com sucesso.") demora
+            # cerca de 10s para aparecer após o clique em OK — aguarda antes
+            # de começar a checar, em vez de gastar ciclos do loop achando
+            # "nenhum popup" enquanto o Domínio ainda está processando.
+            self.log("⏳ Aguardando o Domínio processar (popup de confirmação demora ~10s)...")
+            time.sleep(10)
 
             # Aguarda até 10s fechando avisos informativos que possam surgir.
-            time.sleep(0.3)
             for _ in range(20):
                 sem_dados = self._checar_sem_dados()
                 if sem_dados:
                     self.log("⚠️ 'Sem dados para emitir' — empresa sem movimento no período")
                     return None  # sinaliza "sem dados", não é erro
-                self._tratar_erros_dominio()
+                self._fechar_avisos_vencimento()
+                resultado_popup = self._tratar_erros_dominio()
+                if resultado_popup == "gfip_sucesso":
+                    # Popup de sucesso já fechado — não há motivo para
+                    # continuar o loop de polling até o timeout.
+                    self.log("✅ GFIP gerado com sucesso — encerrando espera")
+                    return True
                 time.sleep(0.5)
 
             return True
@@ -1132,19 +1547,24 @@ class GFIPAutomation:
     # ── Salva o arquivo TXT do GFIP na subpasta da empresa ──────────────────
 
     def salvar_gfip(self, empresa_num: str, empresa_nome: str, dir_saida: str,
-                    comp_inicial: str, comp_final: str, cod_recolhimento: str) -> bool:
+                    comp_inicial: str, comp_final: str, cod_recolhimento: str,
+                    data_atraso: str = None) -> bool:
         """
         Abre a janela do GFIP, preenche os campos e confirma. O Domínio grava
         o arquivo diretamente na pasta informada, com nome de arquivo fixo
         (não editável pelo usuário) — por isso cada empresa usa sua própria
         subpasta dentro de dir_saida, no formato:
             {dir_saida}/{empresa_num}/
+
+        `data_atraso`: ver preencher_gfip — marca "Em Atraso" no indicador do
+        FGTS com essa data, para o fluxo de recálculo de FGTS.
         """
         try:
             pasta_empresa = os.path.join(dir_saida, empresa_num)
             os.makedirs(pasta_empresa, exist_ok=True)
 
-            resultado = self.preencher_gfip(comp_inicial, comp_final, cod_recolhimento, pasta_empresa)
+            resultado = self.preencher_gfip(comp_inicial, comp_final, cod_recolhimento,
+                                            pasta_empresa, data_atraso=data_atraso)
             if resultado is None:
                 return None  # sem dados
             if not resultado:
@@ -1153,27 +1573,64 @@ class GFIPAutomation:
             # Pode surgir confirmação de substituição se já existir arquivo na pasta
             self._confirmar_substituicao_arquivo()
 
-            # Aguarda o Domínio concluir a gravação (janela do GFIP fecha sozinha)
+            # preencher_gfip já confirmou "GFIP gerada com sucesso" — o
+            # arquivo já foi escrito em disco nesse ponto. A janela do GFIP
+            # e a de "Seleção de Empregados" (aberta pelo botão "Seleção...")
+            # continuam abertas na tela e NÃO fecham sozinhas, então em vez
+            # de esperar passivamente (o que só desperdiça até 30s), fecha
+            # ambas ativamente agora para liberar a próxima empresa.
+            self.log("🔻 Fechando janela de Seleção e GFIP após gravação bem-sucedida...")
             fechou = False
-            _t0 = time.time()
-            while time.time() - _t0 < 30:
+            for _ in range(10):
                 if self.should_stop():
                     return False
+
+                fechou_algo = False
+
+                def _cb_selecao(hwnd, _):
+                    nonlocal fechou_algo
+                    try:
+                        if not win32gui.IsWindowVisible(hwnd):
+                            return
+                        t = win32gui.GetWindowText(hwnd).lower()
+                        if "seleção" in t or "selecao" in t:
+                            win32gui.SetForegroundWindow(hwnd)
+                            time.sleep(0.15)
+                            send_keys('{ESC}')
+                            time.sleep(0.3)
+                            fechou_algo = True
+                    except Exception:
+                        pass
+                try:
+                    win32gui.EnumWindows(_cb_selecao, None)
+                except Exception:
+                    pass
+
+                self._fechar_avisos_vencimento()
+                self._tratar_erros_dominio()
+                self._checar_sem_dados()
+
                 try:
                     ext = self.main_window.child_window(title_re=".*GFIP.*", class_name="FNWND3190")
-                    if not ext.exists():
+                    if ext.exists() and ext.is_visible():
+                        ext.set_focus()
+                        time.sleep(0.1)
+                        send_keys('{ESC}')
+                        time.sleep(0.3)
+                        fechou_algo = True
+                    elif not ext.exists():
                         fechou = True
                         break
                 except Exception:
                     fechou = True
                     break
-                self._tratar_erros_dominio()
-                self._checar_sem_dados()
-                time.sleep(0.5)
+
+                if not fechou_algo:
+                    time.sleep(0.3)
 
             if not fechou:
-                self.log("⚠️ Janela do GFIP ainda aberta após gravação — fechando via ESC")
-                self._enviar_escs(4)
+                self.log("⚠️ Janela do GFIP ainda aberta após tentativas de fechamento — enviando ESCs finais")
+                self._enviar_escs(6)
 
             if any(os.scandir(pasta_empresa)):
                 self.log(f"✅ Arquivo GFIP salvo em: {pasta_empresa}")
@@ -1199,7 +1656,37 @@ class GFIPAutomation:
             self._checar_sem_dados()
             time.sleep(0.15)
 
-        # 1. Fecha a janela do GFIP explicitamente via pywinauto (mais confiável)
+        # 1. Fecha a janela "Seleção de Empregados" se ainda estiver aberta —
+        # ela pode ficar por trás da janela do GFIP (título contém "Seleção"),
+        # então é fechada explicitamente por título em vez de depender só dos
+        # ESCs genéricos da janela principal, que nem sempre alcançam quem
+        # está atrás.
+        for _t in range(5):
+            fechou_selecao = False
+            def _cb_selecao(hwnd, _):
+                nonlocal fechou_selecao
+                if fechou_selecao:
+                    return
+                try:
+                    if not win32gui.IsWindowVisible(hwnd):
+                        return
+                    if "seleção" in win32gui.GetWindowText(hwnd).lower() or "selecao" in win32gui.GetWindowText(hwnd).lower():
+                        self.log(f"🔻 Fechando janela 'Seleção' ainda aberta: '{win32gui.GetWindowText(hwnd)}'")
+                        win32gui.SetForegroundWindow(hwnd)
+                        time.sleep(0.2)
+                        send_keys('{ESC}')
+                        time.sleep(0.4)
+                        fechou_selecao = True
+                except Exception:
+                    pass
+            try:
+                win32gui.EnumWindows(_cb_selecao, None)
+            except Exception:
+                pass
+            if not fechou_selecao:
+                break
+
+        # 2. Fecha a janela do GFIP explicitamente via pywinauto (mais confiável)
         for _t in range(5):
             try:
                 ext = self.main_window.child_window(title_re=".*GFIP.*", class_name="FNWND3190")
@@ -1385,9 +1872,20 @@ class GFIPAutomation:
         Fecha diálogos de erro/aviso do Domínio.
         Estratégia: BM_CLICK no botão OK filho do diálogo. Fallback:
         SetForegroundWindow + ENTER.
+
+        Retorna:
+          "gfip_sucesso" — fechou o popup "GFIP gerada com sucesso." (o
+                           chamador pode concluir a etapa imediatamente,
+                           sem esperar o resto do loop de polling)
+          True           — fechou algum outro popup de erro/aviso
+          False          — nenhum popup encontrado
         """
         BM_CLICK    = 0x00F5
-        error_titles = {"erro", "aviso", "atenção", "informação", "alerta"}
+        # "gfip" incluído pois o popup de confirmação final ("GFIP gerada
+        # com sucesso.") usa esse título, não "Aviso"/"Informação" — sem
+        # isso o popup nunca era reconhecido e o bot ficava preso até o
+        # timeout do loop de espera achando "Nenhum popup de aviso encontrado".
+        error_titles = {"erro", "aviso", "atenção", "informação", "alerta", "gfip"}
 
         found_hwnd  = [None]
         found_title = [None]
@@ -1411,7 +1909,7 @@ class GFIPAutomation:
 
         hwnd = found_hwnd[0]
         if hwnd is None:
-            return
+            return False
 
         titulo = found_title[0]
 
@@ -1433,7 +1931,9 @@ class GFIPAutomation:
         # NÃO fechar aqui se for "sem dados para emitir" — _checar_sem_dados trata isso
         if "sem dados" in corpo:
             self.log("🔔 Popup 'sem dados' — delegando para _checar_sem_dados, não fechando aqui")
-            return
+            return False
+
+        eh_sucesso_gfip = "gerada com sucesso" in corpo
 
         # Método 1: pywinauto click_input
         try:
@@ -1442,7 +1942,7 @@ class GFIPAutomation:
             if ok_btn.exists():
                 ok_btn.click_input()
                 self.log(f"🔔 Popup '{titulo}' fechado via click_input()")
-                return
+                return "gfip_sucesso" if eh_sucesso_gfip else True
         except Exception:
             pass
 
@@ -1454,7 +1954,7 @@ class GFIPAutomation:
             if ok_hwnd:
                 win32gui.PostMessage(ok_hwnd, BM_CLICK, 0, 0)
                 self.log(f"🔔 Popup '{titulo}' fechado via PostMessage BM_CLICK")
-                return
+                return "gfip_sucesso" if eh_sucesso_gfip else True
         except Exception:
             pass
 
@@ -1462,7 +1962,7 @@ class GFIPAutomation:
         try:
             win32gui.PostMessage(hwnd, 0x0010, 0, 0)
             self.log(f"🔔 Popup '{titulo}' fechado via WM_CLOSE")
-            return
+            return "gfip_sucesso" if eh_sucesso_gfip else True
         except Exception:
             pass
 
@@ -1472,8 +1972,11 @@ class GFIPAutomation:
             time.sleep(0.1)
             send_keys('{ENTER}')
             self.log(f"🔔 Popup '{titulo}' fechado via ENTER")
+            return "gfip_sucesso" if eh_sucesso_gfip else True
         except Exception:
             pass
+
+        return False
 
     def _checar_sem_dados(self) -> bool:
         """
@@ -1612,13 +2115,17 @@ class GFIPAutomation:
 
     def processar_empresa(self, empresa_num: str, empresa_nome: str,
                           comp_inicial: str, comp_final: str,
-                          cod_recolhimento: str, dir_saida: str):
+                          cod_recolhimento: str, dir_saida: str,
+                          data_atraso: str = None):
         """
         Retorna:
           True         — GFIP gerado e TXT salvo
           'sem_dados'  — empresa sem movimento no período (não é erro)
           'honorarios' — empresa bloqueada pelo módulo Honorários (não é erro)
           False        — falha real
+
+        `data_atraso`: ver preencher_gfip — se informado, marca "Em Atraso"
+        no indicador do FGTS (fluxo de recálculo de FGTS).
         """
         try:
             # Reconecta se necessário
@@ -1665,7 +2172,8 @@ class GFIPAutomation:
 
             # 3. Preenche campos, confirma e salva o TXT direto na subpasta da empresa
             resultado = self.salvar_gfip(empresa_num, empresa_nome, dir_saida,
-                                         comp_inicial, comp_final, cod_recolhimento)
+                                         comp_inicial, comp_final, cod_recolhimento,
+                                         data_atraso=data_atraso)
             if resultado is None:
                 self.log(f"⏭️ {empresa_nome} ignorada: sem dados para emitir no período")
                 time.sleep(0.5)
@@ -1764,6 +2272,7 @@ def run_cli(args):
     comp_final = args.comp_final
     cod_recolhimento = args.cod_recolhimento or ""
     dir_saida = args.dir_saida or os.path.join(os.path.dirname(__file__), "results")
+    data_atraso = args.data_atraso or None
 
     os.makedirs(dir_saida, exist_ok=True)
 
@@ -1779,7 +2288,7 @@ def run_cli(args):
         sys.exit(1)
 
     ok = bot.processar_empresa(str(empresa_num), empresa_nome, comp_inicial, comp_final,
-                               cod_recolhimento, dir_saida)
+                               cod_recolhimento, dir_saida, data_atraso=data_atraso)
 
     if ok:
         _emit("sucesso", f"Empresa {empresa_num} concluída com sucesso", empresa_num)
@@ -1921,6 +2430,9 @@ def main():
     parser.add_argument("--comp-final", dest="comp_final", help="Competência final MM/AAAA (modo CLI)")
     parser.add_argument("--cod-recolhimento", dest="cod_recolhimento", help="Código de Recolhimento (modo CLI)")
     parser.add_argument("--dir-saida", dest="dir_saida", help="Pasta raiz de saída dos TXT (modo CLI)")
+    parser.add_argument("--data-atraso", dest="data_atraso",
+                        help="Se informado (DD/MM/AAAA), marca 'Em Atraso' no indicador do FGTS "
+                             "com essa data (fluxo de recálculo de FGTS). Padrão: não altera (No Prazo).")
     args = parser.parse_args()
 
     if args.worker:
