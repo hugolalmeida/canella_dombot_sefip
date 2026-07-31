@@ -31,7 +31,62 @@ from pywinauto import findwindows, timings
 import win32gui
 import win32con
 import win32process
+import win32api
 from ctypes import wintypes
+
+
+def _nome_pasta_competencia(comp_inicial: str, comp_final: str) -> str:
+    """
+    Converte competência(s) no formato MM/AAAA para o nome de subpasta
+    MM-AAAA (ou MM-AAAA_a_MM-AAAA quando é um intervalo) — organiza os
+    arquivos por competência dentro da pasta da empresa, já que a mesma
+    empresa pode passar pelo recálculo de FGTS várias vezes, uma por
+    competência (com funcionários diferentes em cada rodada).
+    """
+    ini = (comp_inicial or "").replace("/", "-")
+    fim = (comp_final or "").replace("/", "-")
+    if not ini:
+        return "sem-competencia"
+    if fim and fim != ini:
+        return f"{ini}_a_{fim}"
+    return ini
+
+
+def _forcar_foreground(hwnd) -> bool:
+    """
+    SetForegroundWindow sozinho FALHA SILENCIOSAMENTE (sem exceção, sem
+    trocar o foco de verdade) quando o Domínio Folha fica desfocado — ex.:
+    logo após fechar a janela de emissão do GFIP, quando a janela "Seleção
+    de Empregados" reaparece por trás. send_keys('{ESC}') nesse estado não
+    tem efeito nenhum porque o foco de teclado real não está ali, mesmo com
+    a janela visível. Mesmo bug já documentado/corrigido no
+    Bot_Sefip_Protocolo.py: usar AttachThreadInput para "roubar" o foco de
+    volta antes do SetForegroundWindow, sempre desanexando depois.
+    """
+    try:
+        if win32gui.IsIconic(hwnd):
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+    except Exception:
+        pass
+    try:
+        tid_atual = win32api.GetCurrentThreadId()
+        tid_alvo, _ = win32process.GetWindowThreadProcessId(hwnd)
+        anexado = False
+        if tid_alvo != tid_atual:
+            win32process.AttachThreadInput(tid_atual, tid_alvo, True)
+            anexado = True
+        try:
+            win32gui.SetForegroundWindow(hwnd)
+        finally:
+            if anexado:
+                win32process.AttachThreadInput(tid_atual, tid_alvo, False)
+        return True
+    except Exception:
+        try:
+            win32gui.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
+        return False
 
 
 def _hwnd_com_foco_teclado() -> int:
@@ -1244,7 +1299,7 @@ class GFIPAutomation:
 
     def preencher_gfip(self, comp_inicial: str, comp_final: str,
                        cod_recolhimento: str, caminho_completo: str,
-                       data_atraso: str = None) -> bool:
+                       data_atraso: str = None, responsavel: str = "1") -> bool:
         """
         Preenche competência, código de recolhimento e caminho de destino,
         então confirma (OK). A janela abre com foco no campo "Competência"
@@ -1260,6 +1315,18 @@ class GFIPAutomation:
         em atraso. Se None, o indicador permanece no padrão "No Prazo" da
         tela (comportamento normal do GFIP). O indicador de Previdência
         Social (2º par de campos) não é alterado — fora do escopo atual.
+
+        `responsavel`: código do responsável (campo PBEDIT190, ctrl_id=1001)
+        a preencher — cada valor corresponde a um cadastro de responsável
+        diferente (ex.: "1" = um CNPJ, "3" = outro). Padrão "1" mantém o
+        comportamento histórico, mas ESSE VALOR PRECISA BATER com o CNPJ do
+        certificado digital usado depois na Conectividade Social — testado
+        na prática (2026-07-31, empresa GELOARTE): preencher com o
+        responsável errado ("1") gerou um .SFP que a Conectividade recusou
+        com "A inscrição do responsável no arquivo deve ser igual à
+        inscrição da empresa logado", mesmo com todos os outros dados
+        corretos. Não é um erro de código nem de servidor — é o cadastro de
+        responsável errado sendo usado na extração.
 
         O Domínio grava o TXT diretamente no caminho informado, com nome de
         arquivo fixo definido pelo próprio sistema — por isso o caminho deve
@@ -1321,28 +1388,50 @@ class GFIPAutomation:
                     self.log(f"❌ Item '{cod_recolhimento_norm}' não encontrado ciclando o combo de Recolhimento após 6 tentativas — abortando linha (valor atual: '{item_atual.strip()}')")
                     return False
 
-            # Ordem de TAB confirmada via gfip_tab_spy.py (ctrl_id de cada
-            # controle focado, a partir de Competência ctrl_id=1037):
-            #   1024 ComboBox (Recolhimento) -> 1047 ComboBox (Característica)
-            #   -> 1050 ComboBox -> 1001 PBEDIT190 (Responsável)
+            # Ordem de TAB confirmada via snapshot de ComboBoxes (win32,
+            # 2026-07-29) — o comentário anterior estava ERRADO quanto a
+            # qual ctrl_id é qual campo:
+            #   1024 ComboBox (Recolhimento) -> 1047 ComboBox (Tipo Folha,
+            #   valor padrão observado 'Complementar') -> 1050 ComboBox
+            #   ('Recolhimento ao FGTS e Declaração à Previdência', não
+            #   alterado) -> 1001 PBEDIT190 (Responsável)
             #   -> 2 Button "&Arquivo" (radio) -> 1014 Button "..."
             #   -> 1025 Edit (campo de caminho real)
 
-            # TAB — Característica (não alterado)
+            # TAB — combo "Tipo Folha" (ctrl_id=1047). Vem por padrão como
+            # "Complementar", mas o fluxo de recálculo de FGTS SEMPRE exige
+            # "Folha Mensal" — do contrário o Domínio processa a extração
+            # como se não houvesse nada a emitir (sintoma enganoso: aparece
+            # o popup "Sem dados para gerar a GFIP", que parece a empresa
+            # sem movimento no período, mas na verdade é o tipo de folha
+            # errado filtrando os dados). Combo cicla com a tecla "F" tendo
+            # foco nele (mesmo padrão de ciclo por tecla do combo de
+            # Recolhimento, sem abrir dropdown nem precisar de Enter).
             send_keys('{TAB}')
-            time.sleep(0.15)
-            # TAB — próximo combo (Tipo Folha/Complemento/Modalidade — não alterado)
+            time.sleep(0.2)
+            send_keys('f', with_spaces=False)
+            time.sleep(0.3)
+            valor_tipo_folha = self._get_combobox_text_by_ctrl_id(extrator_hwnd, 1047)
+            self.log(f"📝 Tipo Folha: {valor_tipo_folha.strip() or '(não foi possível ler)'}")
+            if "mensal" not in valor_tipo_folha.lower():
+                self.log(f"⚠️ Tipo Folha NÃO ficou 'Folha Mensal' (valor atual: "
+                         f"'{valor_tipo_folha.strip()}') — a extração provavelmente vai falhar "
+                         f"com 'sem dados'. Confira manualmente.")
+
+            # TAB — combo 1050 ('Recolhimento ao FGTS...', não alterado)
             send_keys('{TAB}')
             time.sleep(0.15)
 
-            # TAB — Responsável (ctrl_id=1001, preenchido com "1")
+            # TAB — Responsável (ctrl_id=1001, valor parametrizável —
+            # PRECISA bater com o CNPJ do certificado usado na
+            # Conectividade Social depois, ver docstring do método)
             send_keys('{TAB}')
             time.sleep(0.2)
             send_keys('^a')
             time.sleep(0.1)
-            send_keys('1', with_spaces=False)
+            send_keys(str(responsavel), with_spaces=False)
             time.sleep(0.3)
-            self.log("📝 Responsável: 1")
+            self.log(f"📝 Responsável: {responsavel}")
 
             # Campo de caminho real (ctrl_id=1025, Edit). Em vez de confiar
             # cegamente em mais TABs (se algum passo anterior desviar, uma
@@ -1548,23 +1637,34 @@ class GFIPAutomation:
 
     def salvar_gfip(self, empresa_num: str, empresa_nome: str, dir_saida: str,
                     comp_inicial: str, comp_final: str, cod_recolhimento: str,
-                    data_atraso: str = None) -> bool:
+                    data_atraso: str = None, responsavel: str = "1") -> bool:
         """
         Abre a janela do GFIP, preenche os campos e confirma. O Domínio grava
         o arquivo diretamente na pasta informada, com nome de arquivo fixo
         (não editável pelo usuário) — por isso cada empresa usa sua própria
-        subpasta dentro de dir_saida, no formato:
-            {dir_saida}/{empresa_num}/
+        subpasta dentro de dir_saida, dividida também por competência (uma
+        empresa pode rodar o recálculo de FGTS várias vezes, uma por
+        competência, com funcionários diferentes cada vez — sem a subpasta
+        de competência, uma rodada nova sobrescreveria os arquivos da
+        anterior):
+            {dir_saida}/{empresa_num}/{MM-AAAA}/
+
+        Quando comp_inicial != comp_final (extração de um intervalo), usa
+        {MM-AAAA_inicial}_a_{MM-AAAA_final} como nome da subpasta.
 
         `data_atraso`: ver preencher_gfip — marca "Em Atraso" no indicador do
         FGTS com essa data, para o fluxo de recálculo de FGTS.
+        `responsavel`: ver preencher_gfip — precisa bater com o CNPJ do
+        certificado usado na Conectividade Social.
         """
         try:
-            pasta_empresa = os.path.join(dir_saida, empresa_num)
+            pasta_empresa = os.path.join(
+                dir_saida, empresa_num, _nome_pasta_competencia(comp_inicial, comp_final))
             os.makedirs(pasta_empresa, exist_ok=True)
 
             resultado = self.preencher_gfip(comp_inicial, comp_final, cod_recolhimento,
-                                            pasta_empresa, data_atraso=data_atraso)
+                                            pasta_empresa, data_atraso=data_atraso,
+                                            responsavel=responsavel)
             if resultado is None:
                 return None  # sem dados
             if not resultado:
@@ -1632,6 +1732,45 @@ class GFIPAutomation:
                 self.log("⚠️ Janela do GFIP ainda aberta após tentativas de fechamento — enviando ESCs finais")
                 self._enviar_escs(6)
 
+            # 🔴 A janela 'Seleção de Empregados' pode ser reaberta pelo MESMO
+            # atalho que confirma/envia a extração (mesmo depois de já a
+            # termos fechado no loop acima) — sintoma observado ao vivo:
+            # ela aparece "no final", depois que o loop já reportou sucesso.
+            # Se ficar aberta em lote, trava a troca de empresa seguinte
+            # (o Domínio não deixa trocar com uma janela modal pendente).
+            #
+            # 🔴🔴 CAUSA RAIZ do ESC anterior não funcionar: quando essa
+            # janela reaparece, o Domínio fica DESFOCADO (usuário confirmou
+            # visualmente) — SetForegroundWindow sozinho falha silenciosamente
+            # nesse estado (mesma "focus stealing prevention" do Windows já
+            # documentada no Bot_Sefip_Protocolo.py). send_keys('{ESC}') não
+            # tem efeito nenhum porque o foco de teclado real nunca chegou lá,
+            # mesmo com a janela visivelmente na tela. Corrigido usando
+            # _forcar_foreground (AttachThreadInput) em vez de
+            # SetForegroundWindow puro, e um loop de retry com VERIFICAÇÃO
+            # REAL de fechamento (não confiar num único ESC às cegas).
+            time.sleep(2)
+            for _tentativa in range(5):
+                hselecao_residual = 0
+                def _cb_selecao_final(hwnd, _):
+                    nonlocal hselecao_residual
+                    try:
+                        if win32gui.IsWindowVisible(hwnd):
+                            t = win32gui.GetWindowText(hwnd).lower()
+                            if "seleção" in t or "selecao" in t:
+                                hselecao_residual = hwnd
+                    except Exception:
+                        pass
+                win32gui.EnumWindows(_cb_selecao_final, None)
+                if not hselecao_residual:
+                    break
+                self.log(f"🔻 Janela 'Seleção de Empregados' ainda aberta (tentativa "
+                         f"{_tentativa + 1}/5) — forçando foco e enviando ESC.")
+                _forcar_foreground(hselecao_residual)
+                time.sleep(0.2)
+                send_keys('{ESC}')
+                time.sleep(0.5)
+
             if any(os.scandir(pasta_empresa)):
                 self.log(f"✅ Arquivo GFIP salvo em: {pasta_empresa}")
                 return True
@@ -1672,7 +1811,7 @@ class GFIPAutomation:
                         return
                     if "seleção" in win32gui.GetWindowText(hwnd).lower() or "selecao" in win32gui.GetWindowText(hwnd).lower():
                         self.log(f"🔻 Fechando janela 'Seleção' ainda aberta: '{win32gui.GetWindowText(hwnd)}'")
-                        win32gui.SetForegroundWindow(hwnd)
+                        _forcar_foreground(hwnd)
                         time.sleep(0.2)
                         send_keys('{ESC}')
                         time.sleep(0.4)
@@ -2116,7 +2255,7 @@ class GFIPAutomation:
     def processar_empresa(self, empresa_num: str, empresa_nome: str,
                           comp_inicial: str, comp_final: str,
                           cod_recolhimento: str, dir_saida: str,
-                          data_atraso: str = None):
+                          data_atraso: str = None, responsavel: str = "1"):
         """
         Retorna:
           True         — GFIP gerado e TXT salvo
@@ -2126,6 +2265,9 @@ class GFIPAutomation:
 
         `data_atraso`: ver preencher_gfip — se informado, marca "Em Atraso"
         no indicador do FGTS (fluxo de recálculo de FGTS).
+        `responsavel`: ver preencher_gfip — precisa bater com o CNPJ do
+        certificado usado na Conectividade Social, senão o .SFP gerado é
+        recusado na hora do envio.
         """
         try:
             # Reconecta se necessário
@@ -2173,7 +2315,7 @@ class GFIPAutomation:
             # 3. Preenche campos, confirma e salva o TXT direto na subpasta da empresa
             resultado = self.salvar_gfip(empresa_num, empresa_nome, dir_saida,
                                          comp_inicial, comp_final, cod_recolhimento,
-                                         data_atraso=data_atraso)
+                                         data_atraso=data_atraso, responsavel=responsavel)
             if resultado is None:
                 self.log(f"⏭️ {empresa_nome} ignorada: sem dados para emitir no período")
                 time.sleep(0.5)
@@ -2273,6 +2415,7 @@ def run_cli(args):
     cod_recolhimento = args.cod_recolhimento or ""
     dir_saida = args.dir_saida or os.path.join(os.path.dirname(__file__), "results")
     data_atraso = args.data_atraso or None
+    responsavel = args.responsavel or "1"
 
     os.makedirs(dir_saida, exist_ok=True)
 
@@ -2288,7 +2431,8 @@ def run_cli(args):
         sys.exit(1)
 
     ok = bot.processar_empresa(str(empresa_num), empresa_nome, comp_inicial, comp_final,
-                               cod_recolhimento, dir_saida, data_atraso=data_atraso)
+                               cod_recolhimento, dir_saida, data_atraso=data_atraso,
+                               responsavel=responsavel)
 
     if ok:
         _emit("sucesso", f"Empresa {empresa_num} concluída com sucesso", empresa_num)
@@ -2433,6 +2577,11 @@ def main():
     parser.add_argument("--data-atraso", dest="data_atraso",
                         help="Se informado (DD/MM/AAAA), marca 'Em Atraso' no indicador do FGTS "
                              "com essa data (fluxo de recálculo de FGTS). Padrão: não altera (No Prazo).")
+    parser.add_argument("--responsavel", dest="responsavel", default="1",
+                        help="Código do responsável a preencher na extração (campo PBEDIT190). "
+                             "PRECISA bater com o CNPJ do certificado usado depois na Conectividade "
+                             "Social — testado na prática: valor errado gera .SFP recusado com "
+                             "'inscrição do responsável diferente da empresa logada'. Padrão: '1'.")
     args = parser.parse_args()
 
     if args.worker:

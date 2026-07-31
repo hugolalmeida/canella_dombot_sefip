@@ -35,6 +35,7 @@ Versão: 0.1 (Etapas 1-3)
 
 import argparse
 import ctypes
+import os
 import sys
 import time
 import traceback
@@ -44,6 +45,11 @@ import win32api
 import win32con
 import win32gui
 from pywinauto.keyboard import send_keys
+
+try:
+    from pypdf import PdfReader
+except ImportError:
+    PdfReader = None
 
 
 def _esta_elevado() -> bool:
@@ -149,20 +155,46 @@ class SefipAutomation:
     def __init__(self, logger=None):
         self.log = logger or ConsoleLogger()
         self.main_hwnd = 0
+        self.mensagem_inconsistencia = None
 
     # ── Conexão ──────────────────────────────────────────────────────────────
 
     def conectar(self) -> bool:
-        """Localiza a janela principal do SEFIP (TfrmPrincipalSEFIP)."""
+        """
+        Localiza a janela principal do SEFIP (TfrmPrincipalSEFIP).
+
+        🔴 NÃO filtra por _visivel: quando o SEFIP está minimizado, a Tfrm
+        principal fica com IsWindowVisible=False (e mesmo assim NÃO se
+        declara IsIconic=True — quem carrega esse estado é a janela-sombra
+        do processo, classe TApplication, título também "Sefip", owner da
+        Tfrm via GetWindow(GW_OWNER)). Filtrar por visível faz sobrar só a
+        TApplication, que casa no critério fraco de título mas NÃO tem o
+        menu de verdade — testado na prática (Bot_Sefip_Protocolo.py,
+        2026-07-28): rodar com o SEFIP minimizado conectava na janela
+        errada. Prioriza sempre match por classe Tfrm...SEFIP (a principal
+        de verdade) sobre o critério fraco de título.
+        """
         self.log.info("🔎 Localizando SEFIP...")
 
-        def _eh_sefip(h):
-            c = _cls(h)
-            t = _txt(h)
-            return (c.startswith("Tfrm") and "SEFIP" in c.upper()) or \
-                   (t.upper().startswith("SEFIP") and c.startswith("T"))
+        por_classe, por_titulo = [], []
 
-        janelas = _enum_toplevel(_eh_sefip)
+        def _cb(h, _):
+            try:
+                c, t = _cls(h), _txt(h)
+                if c.startswith("Tfrm") and "SEFIP" in c.upper():
+                    por_classe.append(h)
+                elif t.upper().startswith("SEFIP") and c.startswith("T"):
+                    por_titulo.append(h)
+            except Exception:
+                pass
+            return True
+
+        try:
+            win32gui.EnumWindows(_cb, None)
+        except Exception:
+            pass
+        janelas = por_classe or por_titulo
+
         if not janelas:
             self.log.error("❌ SEFIP não encontrado. Abra o sistema antes de iniciar.")
             return False
@@ -172,9 +204,20 @@ class SefipAutomation:
         return True
 
     def _trazer_frente(self, hwnd):
+        """
+        Restaura e foca a janela. Também restaura a OWNER (GetWindow
+        GW_OWNER) se ela estiver minimizada — no SEFIP, é a janela-sombra
+        TApplication (owner da Tfrm principal) que carrega o estado
+        IsIconic de verdade; restaurar só a Tfrm não traz nada de volta à
+        tela (ver nota em conectar()).
+        """
         try:
             if win32gui.IsIconic(hwnd):
                 win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                time.sleep(0.3)
+            owner = win32gui.GetWindow(hwnd, win32con.GW_OWNER)
+            if owner and win32gui.IsIconic(owner):
+                win32gui.ShowWindow(owner, win32con.SW_RESTORE)
                 time.sleep(0.3)
             win32gui.SetForegroundWindow(hwnd)
             time.sleep(0.3)
@@ -752,13 +795,19 @@ class SefipAutomation:
                 return h
         return 0
 
-    def executar_movimento(self, timeout_processamento=180) -> str:
+    def executar_movimento(self, timeout_processamento=180, ler_inconsistencia=True) -> str:
         """
         Clica no botão 'Executar' da tela Abertura de Movimento e aguarda
         o resultado. O clique é SÍNCRONO/BLOQUEANTE no SEFIP (o processamento
         pode levar dezenas de segundos a alguns minutos) — por isso usamos
         PostMessage (assíncrono) em vez de SendMessage, e faz polling do
         resultado em vez de esperar o retorno da mensagem.
+
+        `ler_inconsistencia`: se True (padrão) e o Executar detectar
+        inconsistência, abre o relatório (Sim), gera o PDF e tenta extrair a
+        mensagem de erro (ver _ler_relatorio_inconsistencia), deixando o
+        resultado em self.mensagem_inconsistencia. Se False, mantém o
+        comportamento antigo (responde Não, não vê o relatório).
 
         Retorna:
           'sucesso'      — popup 'Informação'+OK único; abriu tela de Geração
@@ -832,9 +881,22 @@ class SefipAutomation:
             hatencao = self._achar_popup(titulos=["atenção", "atencao"],
                                          classes=("TfrmExibeMsg", "TMessageForm", "#32770"))
             if hatencao:
-                self.log.warning("🔔 Popup 'Atenção' detectado — inconsistência no cadastro "
-                                 "(ex.: FAP inválido). Fechando sem ver relatório (Não).")
-                self._clicar_no_popup(hatencao, "Não")
+                if ler_inconsistencia:
+                    self.log.warning("🔔 Popup 'Atenção' detectado — inconsistência no "
+                                     "cadastro. Abrindo relatório (Sim) para identificar a causa.")
+                    self._clicar_no_popup(hatencao, "Sim")
+                    time.sleep(1.5)
+                    self.mensagem_inconsistencia = self._ler_relatorio_inconsistencia()
+                    if self.mensagem_inconsistencia:
+                        self.log.error(f"📄 Inconsistência (extraída do PDF): "
+                                      f"{self.mensagem_inconsistencia}")
+                    else:
+                        self.log.warning("⚠️ Não consegui extrair o texto do relatório de "
+                                         "inconsistência — confira manualmente o PDF/tela.")
+                else:
+                    self.log.warning("🔔 Popup 'Atenção' detectado — inconsistência no cadastro "
+                                     "(ex.: FAP inválido). Fechando sem ver relatório (Não).")
+                    self._clicar_no_popup(hatencao, "Não")
                 time.sleep(1)
                 return "inconsistencia"
 
@@ -845,6 +907,153 @@ class SefipAutomation:
 
         self.log.warning("⚠️ Timeout aguardando resultado do Executar.")
         return "timeout"
+
+    def _achar_tela_inconsistencia(self) -> int:
+        achados = _enum_toplevel(
+            lambda h: _cls(h) == "TfrmImprimeRelInconsistencia" or
+                     "inconsist" in _txt(h).lower())
+        return achados[0] if achados else 0
+
+    def _ler_relatorio_inconsistencia(self, timeout=20) -> str:
+        """
+        Na tela 'Impressão de Relatório' (TfrmImprimeRelInconsistencia,
+        botões Visualizar/Imprimir/Gerar PDF/Fechar): clica 'Gerar PDF',
+        salva num caminho temporário previsível, lê o texto do PDF (via
+        pypdf) e fecha a tela. Contorna a limitação antiga de que o
+        TQRPreview (relatório gráfico) não é legível via win32 — o PDF tem
+        o mesmo conteúdo, só que como texto extraível.
+
+        Retorna a mensagem de inconsistência extraída (string), ou "" se
+        não foi possível gerar/ler o PDF.
+        """
+        htela = self._achar_tela_inconsistencia()
+        if not htela:
+            self.log.warning("⚠️ Tela de relatório de inconsistência não encontrada.")
+            return ""
+
+        hgerar = None
+        for h in _enum_filhos(htela):
+            if _cls(h) in ("TBitBtn", "TButton") and "pdf" in _norm(_txt(h)):
+                hgerar = h
+                break
+        if not hgerar:
+            self.log.warning("⚠️ Botão 'Gerar PDF' não encontrado na tela de inconsistência.")
+            return ""
+
+        self.log.info("📄 Clicando 'Gerar PDF' para capturar a inconsistência...")
+        self._trazer_frente(htela)
+        time.sleep(0.3)
+        win32gui.PostMessage(hgerar, BM_CLICK, 0, 0)
+        time.sleep(1.5)
+
+        # Diálogo clássico "Salvar como" (Nome=ctrl_id 1152, botão=ctrl_id 1),
+        # mesmo padrão já usado em outras telas do SEFIP.
+        caminho_pdf = os.path.join(
+            os.environ.get("TEMP", "."), f"sefip_inconsistencia_{int(time.time())}.pdf")
+        t0 = time.time()
+        hdialog = 0
+        while time.time() - t0 < timeout:
+            hdialog = None
+            for h in _enum_toplevel(lambda h: _cls(h) == "#32770"):
+                hdialog = h
+                break
+            if hdialog:
+                break
+            time.sleep(0.3)
+        if not hdialog:
+            self.log.warning("⚠️ Diálogo 'Salvar PDF como' não apareceu.")
+            return ""
+
+        hedit = self._achar_filho_por_ctrl_id_win32(hdialog, 1152, "Edit")
+        hsalvar = None
+        for h in _enum_filhos(hdialog):
+            if _cls(h) == "Button" and win32gui.GetDlgCtrlID(h) == 1:
+                hsalvar = h
+                break
+        if not hedit or not hsalvar:
+            self.log.warning("⚠️ Campo Nome ou botão Salvar não encontrados no diálogo do PDF.")
+            return ""
+
+        self._trazer_frente(hdialog)
+        time.sleep(0.3)
+        win32gui.SendMessage(hedit, win32con.WM_SETTEXT, 0, caminho_pdf)
+        time.sleep(0.3)
+        win32gui.PostMessage(hsalvar, BM_CLICK, 0, 0)
+        time.sleep(1.5)
+
+        # Aguarda o arquivo aparecer em disco (o SEFIP grava de forma
+        # assíncrona em relação ao clique) e fecha popups residuais (OK).
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            if os.path.exists(caminho_pdf) and os.path.getsize(caminho_pdf) > 0:
+                break
+            hpopup = self._achar_popup(classes=("TfrmExibeMsg", "TMessageForm", "#32770"))
+            if hpopup:
+                self._clicar_no_popup(hpopup, "OK")
+                time.sleep(0.5)
+            time.sleep(0.4)
+
+        texto = ""
+        if os.path.exists(caminho_pdf):
+            texto = self._extrair_erro_pdf_inconsistencia(caminho_pdf)
+            try:
+                os.remove(caminho_pdf)
+            except Exception:
+                pass
+        else:
+            self.log.warning(f"⚠️ PDF não encontrado em '{caminho_pdf}' após Gerar PDF.")
+
+        # Fecha a tela de relatório (botão 'Fechar'), liberando o SEFIP.
+        htela = self._achar_tela_inconsistencia()
+        if htela:
+            self._clicar_botao_por_texto(htela, "Fechar", classes=("TBitBtn", "TButton"),
+                                         assincrono=True)
+            time.sleep(1)
+
+        return texto
+
+    def _extrair_erro_pdf_inconsistencia(self, caminho: str) -> str:
+        """
+        Extrai a mensagem de erro do "Relatório de Inconsistências do
+        Fechamento" gerado pelo SEFIP. Formato real confirmado (2026-07-31,
+        empresa GELOARTE, cód. 101177 — FAP inválido):
+
+            CONTEÚDO DO CAMPO
+            CÓDIGO - DESCRIÇÃO DO ERRO
+            TRABALHADOR
+            03.081.396/0001-37
+            0,00
+            101177-ALÍQUOTA FAP INVÁLIDA. O VALOR DEVE ESTAR ENTRE 0,5 E 2,00.
+
+        A linha do erro em si é sempre "<código numérico>-<descrição em
+        maiúsculas>", isolada numa linha própria — é isso que a regex busca,
+        não a posição fixa (o relatório pode ter mais ou menos linhas de
+        cabeçalho dependendo da versão/idioma do SEFIP).
+        """
+        if PdfReader is None:
+            self.log.warning("⚠️ Biblioteca pypdf não disponível — não consigo ler o PDF.")
+            return ""
+        try:
+            leitor = PdfReader(caminho)
+            texto_bruto = "\n".join(p.extract_text() or "" for p in leitor.pages)
+        except Exception as e:
+            self.log.warning(f"⚠️ Falha ao ler o PDF de inconsistência: {type(e).__name__}: {e}")
+            return ""
+
+        import re
+        # Código: 4-6 dígitos. Descrição: resto da linha (maiúsculas/acentos/
+        # pontuação), até a quebra de linha do PDF.
+        erros = re.findall(r"^(\d{4,6})-(.+)$", texto_bruto, flags=re.MULTILINE)
+        if erros:
+            linhas = [f"{codigo} - {descricao.strip()}" for codigo, descricao in erros]
+            return " | ".join(linhas)
+
+        # Fallback: não achou o padrão esperado — devolve o texto inteiro
+        # normalizado, para não perder a informação (mesmo sem conseguir
+        # isolar só a linha do erro).
+        self.log.warning("⚠️ Não encontrei o padrão 'código-descrição' esperado no PDF — "
+                         "retornando o texto completo extraído.")
+        return " ".join(texto_bruto.split())
 
     def _achar_tela_geracao_arquivo(self) -> int:
         achados = _enum_toplevel(lambda h: _cls(h) == "TfrmGravarDisco")
@@ -1000,8 +1209,12 @@ def run_teste(args):
         resultado = bot.executar_movimento()
 
         if resultado == "inconsistencia":
-            bot.log.error("❌ Inconsistência no cadastro (ex.: FAP inválido). "
-                          "Corrija manualmente e rode a Etapa 4 novamente.")
+            if bot.mensagem_inconsistencia:
+                bot.log.error(f"❌ Inconsistência no cadastro: {bot.mensagem_inconsistencia}")
+            else:
+                bot.log.error("❌ Inconsistência no cadastro (ex.: FAP inválido) — não foi "
+                              "possível extrair a mensagem exata do PDF, confira manualmente.")
+            bot.log.error("   Corrija o cadastro e rode a Etapa 4 novamente.")
             sys.exit(1)
         elif resultado == "data_invalida":
             bot.log.error("❌ Data de atraso fora da vigência do edital de índices. "

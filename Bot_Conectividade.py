@@ -65,6 +65,15 @@ from datetime import datetime
 
 from playwright.sync_api import sync_playwright
 
+# Vigia da janela NATIVA do CriptoCNS (assinador da Caixa). Ela não existe no
+# DOM — é um processo Win32 —, então Playwright nunca a encontra: o sintoma é
+# o "Enviar" ficar desabilitado e o fluxo parar sem erro. Opcional: se o
+# módulo não estiver presente, o bot segue funcionando (só não trata sozinho).
+try:
+    from vigia_criptocns import VigiaCriptoCNS
+except ImportError:
+    VigiaCriptoCNS = None
+
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
@@ -532,6 +541,15 @@ def _conferir_anexo(page, arquivo, rastro):
     except Exception:
         pass
 
+    # O site pode ACEITAR o arquivo na lista (com ícone de check!) e mesmo
+    # assim recusá-lo na validação de conteúdo, escrevendo a razão em vermelho
+    # logo abaixo do nome. Confirmado em 2026-07-29:
+    #   "Não é possível enviar o arquivo. A inscrição do responsável no
+    #    arquivo deve ser igual á inscrição da empresa logado."
+    # Sem ler isso, o bot só veria "Enviar desabilitado" e reportaria um
+    # erro genérico — escondendo a causa real, que é de CADASTRO, não do bot.
+    erro_arquivo = _ler_erro_do_anexo(page, item, rastro)
+
     # O Angular pode habilitar o Enviar de forma assíncrona (depois de validar
     # o arquivo), então não basta amostrar uma vez: espera até 8s.
     enviar_habilitado = False
@@ -547,15 +565,105 @@ def _conferir_anexo(page, arquivo, rastro):
         time.sleep(0.5)
 
     rastro.evento("conferencia_anexo", arquivo=nome, anexo_ok=anexo_ok,
-                  enviar_habilitado=enviar_habilitado)
-    if anexo_ok and enviar_habilitado:
+                  enviar_habilitado=enviar_habilitado, erro_arquivo=erro_arquivo)
+
+    if erro_arquivo:
+        rastro.log("❌ O SITE RECUSOU O ARQUIVO:")
+        rastro.log(f"   {erro_arquivo}")
+        for dica in _explicar_recusa(erro_arquivo):
+            rastro.log(f"   → {dica}")
+        rastro.marco(page, "arquivo_recusado")
+    elif anexo_ok and enviar_habilitado:
         rastro.log(f"✅ Anexo confirmado na lista ({nome}) e botão Enviar habilitado.")
     else:
         rastro.log(f"⚠️ Conferência do anexo FALHOU — arquivo na lista: {anexo_ok}, "
                    f"Enviar habilitado: {enviar_habilitado}. O formulário pode "
                    f"não estar realmente pronto para envio.")
         rastro.marco(page, "anexo_nao_confirmado")
-    return anexo_ok, enviar_habilitado
+    return anexo_ok, enviar_habilitado, erro_arquivo
+
+
+# Mensagens de recusa conhecidas do site → explicação acionável. A chave é um
+# trecho estável (sem acento/caixa) da mensagem; o site escreve "á" onde
+# deveria ser "à", então casamos por pedaços curtos e tolerantes.
+RECUSAS_CONHECIDAS = [
+    (("inscricao do responsavel", "inscricao da empresa"),
+     ["O CNPJ do responsável DENTRO do .SFP não bate com o certificado logado.",
+      "Não é erro do bot nem do arquivo em si: é cadastro.",
+      "Ou o SEFIP gerou o arquivo com outro responsável, ou é preciso entrar "
+      "em 'Acessar Empresa Outorgante' com a empresa correta.",
+      "Confira o responsável no SEFIP (Cadastro de Responsável) antes de reenviar."]),
+    (("arquivo ja foi enviado",),
+     ["Este arquivo já consta como transmitido — confira em 'Itens Enviados' "
+      "antes de reenviar, para não duplicar."]),
+    (("layout", "versao"),
+     ["O layout/versão do arquivo não é o aceito pela Caixa — regerar no SEFIP."]),
+    (("competencia",),
+     ["Competência do arquivo inconsistente com o serviço selecionado."]),
+]
+
+
+def _sem_acento(texto):
+    import unicodedata
+    return "".join(c for c in unicodedata.normalize("NFD", texto or "")
+                   if unicodedata.category(c) != "Mn").lower()
+
+
+def _explicar_recusa(mensagem):
+    """Traduz a mensagem do site em próximos passos. Vazio se desconhecida."""
+    alvo = _sem_acento(mensagem)
+    for marcas, dicas in RECUSAS_CONHECIDAS:
+        if all(m in alvo for m in marcas):
+            return dicas
+    return ["Recusa não catalogada — trate manualmente e me avise o texto "
+            "para eu adicionar o tratamento."]
+
+
+def _ler_erro_do_anexo(page, item, rastro):
+    """
+    Lê a mensagem de recusa que o site escreve dentro do item do anexo.
+
+    Estratégia em camadas porque não sabemos a classe exata do elemento:
+    procura texto em vermelho / classes de erro dentro do item e, como
+    último recurso, qualquer linha do item que não seja o nome do arquivo.
+    """
+    seletores = [".erro", ".error", ".mat-error", ".text-danger",
+                 "[class*='erro']", "[class*='error']", "small", "span"]
+    try:
+        alvo = item.first
+    except Exception:
+        return None
+
+    for sel in seletores:
+        try:
+            loc = alvo.locator(sel)
+            for i in range(min(loc.count(), 6)):
+                txt = (loc.nth(i).inner_text() or "").strip()
+                if _parece_erro(txt):
+                    return " ".join(txt.split())
+        except Exception:
+            continue
+
+    # Fallback: o texto inteiro do item, tirando o nome do arquivo.
+    try:
+        inteiro = " ".join((alvo.inner_text() or "").split())
+        for linha in inteiro.split("  "):
+            if _parece_erro(linha):
+                return linha.strip()
+        if _parece_erro(inteiro):
+            return inteiro
+    except Exception:
+        pass
+    return None
+
+
+def _parece_erro(texto):
+    if not texto or len(texto) < 15:
+        return False
+    alvo = _sem_acento(texto)
+    marcas = ("nao e possivel", "nao foi possivel", "erro", "invalid",
+              "deve ser igual", "nao permitido", "recusado", "falha")
+    return any(m in alvo for m in marcas)
 
 
 def _botao(page, texto, exato=True):
@@ -671,7 +779,9 @@ def enviar_arquivo_sefip(arquivo: str, nome_mensagem: str, estado: str,
                          dir_debug: str = None,
                          timeout_revisao: int = TIMEOUT_REVISAO_PADRAO,
                          cdp: str = None, arquivo_token: str = ARQUIVO_TOKEN_PADRAO,
-                         injetar_token: bool = True, nome_maquina: str = None):
+                         injetar_token: bool = True, nome_maquina: str = None,
+                         vigiar_criptocns: bool = True,
+                         criptocns_nao_perguntar: bool = False):
     """
     Preenche o formulário "Nova Mensagem" (Envio de arquivo SEFIP) e anexa
     o arquivo.
@@ -742,6 +852,16 @@ def enviar_arquivo_sefip(arquivo: str, nome_mensagem: str, estado: str,
         if debug:
             log(f"🔎 Modo debug: artefatos em {dir_debug}")
 
+        # Precisa começar ANTES de qualquer navegação: o CriptoCNS pode pedir
+        # autorização já na abertura da Caixa Postal, não só no Enviar.
+        vigia = None
+        if vigiar_criptocns and VigiaCriptoCNS is not None:
+            vigia = VigiaCriptoCNS(
+                marcar_nao_perguntar=criptocns_nao_perguntar, log=log).iniciar()
+        elif vigiar_criptocns:
+            log("ℹ️ vigia_criptocns.py não encontrado ao lado do script — se a "
+                "janela do CriptoCNS aparecer, clique 'Aceitar' manualmente.")
+
         try:
             log(f"🌐 Acessando {URL_INICIAL} ...")
             page.goto(URL_INICIAL, wait_until="domcontentloaded")
@@ -809,9 +929,25 @@ def enviar_arquivo_sefip(arquivo: str, nome_mensagem: str, estado: str,
             page.set_input_files(SEL_ARQUIVO[0], arquivo)
             time.sleep(1)
 
-            anexo_ok, enviar_ok = _conferir_anexo(page, arquivo, rastro)
+            anexo_ok, enviar_ok, erro_arquivo = _conferir_anexo(page, arquivo, rastro)
             resultado["anexo_ok"] = anexo_ok
             resultado["enviar_habilitado"] = enviar_ok
+            resultado["erro_arquivo"] = erro_arquivo
+
+            # Recusa do site é caso à parte: não é falha do bot nem coisa que
+            # retentar resolva. Sai com status próprio para o orquestrador
+            # poder separar "erro técnico" de "arquivo/cadastro inválido" e
+            # seguir para a próxima empresa em vez de abortar o lote.
+            if erro_arquivo:
+                resultado["status"] = "recusado_pelo_site"
+                resultado["erro"] = erro_arquivo
+                resultado["acao_sugerida"] = _explicar_recusa(erro_arquivo)
+                rastro.marco(page, "formulario_recusado")
+                if not confirmar_envio:
+                    log("🔍 Mantendo o navegador aberto para você conferir a "
+                        "mensagem do site...")
+                    _aguardar_revisao_manual(page, rastro, min(timeout_revisao, 600))
+                return resultado
 
             rastro.marco(page, "formulario_preenchido")
             log("=" * 70)
@@ -862,6 +998,9 @@ def enviar_arquivo_sefip(arquivo: str, nome_mensagem: str, estado: str,
             return resultado
 
         finally:
+            if vigia is not None:
+                resultado["criptocns_tratadas"] = vigia.tratadas
+                vigia.parar()
             rastro.encerrar(context)
             # Com --cdp o navegador é do USUÁRIO: nunca fechar o contexto (isso
             # derrubaria as abas dele). Só desconecta.
@@ -1233,6 +1372,14 @@ def main():
                         "perfil novo (ex.: --cdp ou --cdp http://localhost:9222). "
                         "O Chrome precisa ter sido iniciado com "
                         "--remote-debugging-port=9222.")
+    p.add_argument("--sem-vigia-criptocns", dest="vigiar_criptocns",
+                   action="store_false",
+                   help="Não trata automaticamente a janela nativa do CriptoCNS "
+                        "(por padrão o bot clica 'Aceitar' nela).")
+    p.add_argument("--criptocns-nao-perguntar", dest="criptocns_nao_perguntar",
+                   action="store_true",
+                   help="Marca 'Não perguntar novamente' na janela do CriptoCNS "
+                        "(configuração PERSISTENTE da máquina).")
     p.add_argument("--nome-maquina", dest="nome_maquina",
                    help="Nome da máquina no cadastro (máx. 30 chars). Sem isso, "
                         "mantém o sugerido pelo site (CNPJ_data hora).")
@@ -1271,10 +1418,20 @@ def main():
         timeout_revisao=args.timeout_revisao, cdp=args.cdp,
         arquivo_token=args.arquivo_token, injetar_token=args.injetar_token,
         nome_maquina=args.nome_maquina,
+        vigiar_criptocns=args.vigiar_criptocns,
+        criptocns_nao_perguntar=args.criptocns_nao_perguntar,
     )
 
     print("🏁 " + json.dumps(resultado, ensure_ascii=False))
-    sys.exit(0 if resultado.get("status", "erro") != "erro" else 1)
+
+    # Códigos de saída distintos para o orquestrador decidir o que fazer:
+    #   0 = ok   |   2 = o SITE recusou (cadastro/arquivo: exige ação humana,
+    #   retentar não adianta)   |   1 = erro técnico (pode valer retry)
+    status = resultado.get("status", "erro")
+    if status == "recusado_pelo_site":
+        print("↳ Recusa do site: NÃO adianta repetir — corrija o cadastro/arquivo.")
+        sys.exit(2)
+    sys.exit(0 if status != "erro" else 1)
 
 
 if __name__ == "__main__":
