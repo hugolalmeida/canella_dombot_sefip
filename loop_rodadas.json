@@ -1,0 +1,17 @@
+[
+  {
+    "empresa": "25",
+    "empresa_nome": "GELO ARTE",
+    "comp_inicial": "12/2018",
+    "comp_final": "12/2018",
+    "data_atraso": "20/08/2026",
+    "responsavel": "3",
+    "funcionario": [
+      "MARCELO DOS SANTOS SENHORINHO"
+    ],
+    "nome_mensagem": "GFIP 25 - 12-2018",
+    "estado": "Rio de Janeiro",
+    "base_arrecadacao": "Volta Redonda / RJ",
+    "com_backup": true
+  }
+]

@@ -77,24 +77,56 @@ CORPO_CONTEM = ("certificados", "conectividadesocial")
 CLASSE_ELECTRON = "chrome_widgetwin"
 EXE_ESPERADO = "criptocns.exe"
 
-# Posição do botão "Aceitar" como FRAÇÃO do retângulo da janela — nunca em
-# pixels absolutos, para sobreviver a mudança de posição/resolução.
-# Aferido em DUAS capturas independentes do diálogo real (2026-07-29):
-#   captura A: janela 587x240 -> botão x=[0.055,0.216] y=[0.717,0.808]
-#   captura B: janela 430x176 -> botão x=[0.072,0.205] y=[0.693,0.812]
-# Centro convergente ~ (0.136, 0.758). A margem é folgada: o botão ocupa
-# ~15% da largura, então um erro de alguns pontos percentuais ainda acerta.
-FRACAO_ACEITAR = (0.136, 0.758)
+# O CriptoCNS tem PELO MENOS 2 diálogos diferentes, mesmo título/processo,
+# tamanhos e layouts DISTINTOS — não é só variação de DPI do mesmo diálogo:
+#   1. "enumerar certificados de assinatura instalados" (autorização geral,
+#      pergunta simples, sem caixa de texto) — o pequeno.
+#   2. "enviou o documento a seguir para ser assinado" (com uma caixa de
+#      texto mostrando "Nome arquivo:...código hash:...") — o grande,
+#      aparece no envio de cada arquivo, não só na 1ª vez da sessão.
+# Cada um tem sua própria fração calibrada — por isso PERFIS_DIALOGO é uma
+# lista, e tratar_dialogo_electron tenta achar o perfil cujo TAMANHO bate
+# (dentro da tolerância) antes de calcular a coordenada do clique.
+PERFIS_DIALOGO = [
+    {
+        # Diálogo pequeno — "enumerar certificados" (aferido em 2026-07-29,
+        # 2 capturas independentes: 587x240 e 430x176, convergindo em ~(0.136,
+        # 0.758); o botão ocupa ~15% da largura, margem folgada).
+        # Checkbox "Não perguntar novamente" calibrado ao vivo em 2026-08-03
+        # (posicionamento visual iterativo do usuário — cursor movido sem
+        # clicar até confirmar visualmente que estava centralizado no
+        # checkbox real, testado e confirmado marcando + fechando o diálogo
+        # com sucesso): fração (0.501, 0.716).
+        "tamanho_esperado": (600, 250),
+        "fracao_aceitar": (0.136, 0.758),
+        "caixa_aceitar": (0.055, 0.693, 0.216, 0.812),
+        "fracao_nao_perguntar": (0.501, 0.716),
+    },
+    {
+        # Diálogo grande — "assinatura de documento" (aferido em 2026-08-04,
+        # rect real 800x500, com a caixa de texto do nome do arquivo/hash).
+        # Fração confirmada por posicionamento visual do usuário (cursor
+        # sobre o botão real antes de clicar, sem clicar às cegas).
+        # Checkbox "Não perguntar novamente" calibrado do mesmo jeito em
+        # 2026-08-03: fração (0.375, 0.795), testado marcando + clicando
+        # Aceitar com sucesso (janela fechou).
+        "tamanho_esperado": (800, 500),
+        "fracao_aceitar": (0.10, 0.81),
+        "caixa_aceitar": (0.03, 0.77, 0.22, 0.85),
+        "fracao_nao_perguntar": (0.375, 0.795),
+    },
+]
 
-# Caixa do botão em frações, usada nos testes de regressão para garantir que
-# o ponto calculado cai DENTRO do botão (e não no "Recusar", à direita).
-CAIXA_ACEITAR = (0.055, 0.693, 0.216, 0.812)
-
-# Dimensões esperadas do diálogo. Se a janela vier com tamanho muito
-# diferente, o layout mudou e o clique proporcional deixa de ser confiável —
-# nesse caso o vigia se RECUSA a clicar e avisa, em vez de clicar às cegas.
-TAMANHO_ESPERADO = (600, 250)
+# Tolerância de tamanho compartilhada entre os perfis — se a janela vier
+# fora de TODOS os perfis conhecidos (dentro dessa margem), o layout mudou
+# de vez e o vigia se RECUSA a clicar, avisando para recalibrar.
 TOLERANCIA_TAMANHO = 0.25
+
+# Mantidos por compatibilidade com código/testes existentes que ainda
+# referenciam essas constantes — sempre apontam para o 1º perfil (pequeno).
+FRACAO_ACEITAR = PERFIS_DIALOGO[0]["fracao_aceitar"]
+CAIXA_ACEITAR = PERFIS_DIALOGO[0]["caixa_aceitar"]
+TAMANHO_ESPERADO = PERFIS_DIALOGO[0]["tamanho_esperado"]
 
 TEXTO_ACEITAR = "aceitar"
 TEXTO_NAO_PERGUNTAR = "não perguntar novamente"
@@ -342,21 +374,50 @@ def _clicar_coordenada(x, y, log=print):
                 pass
 
 
-def tratar_dialogo_electron(hwnd, log=print):
+def _achar_perfil(rect):
+    """
+    Retorna o perfil de PERFIS_DIALOGO cujo tamanho esperado bate com o
+    retângulo real (dentro de TOLERANCIA_TAMANHO), ou None se nenhum bater —
+    nesse caso o layout mudou de verdade e não dá pra confiar em nenhuma
+    fração calibrada.
+    """
+    largura, altura = rect[2] - rect[0], rect[3] - rect[1]
+    if largura <= 0 or altura <= 0:
+        return None
+    for perfil in PERFIS_DIALOGO:
+        esp_larg, esp_alt = perfil["tamanho_esperado"]
+        if (abs(largura - esp_larg) <= esp_larg * TOLERANCIA_TAMANHO and
+                abs(altura - esp_alt) <= esp_alt * TOLERANCIA_TAMANHO):
+            return perfil
+    return None
+
+
+def tratar_dialogo_electron(hwnd, marcar_nao_perguntar=False, log=print):
     """
     Clica "Aceitar" no diálogo Electron por coordenada proporcional.
 
-    Antes de clicar confere o tamanho da janela: se o layout mudou, prefere
-    NÃO clicar (clicar às cegas poderia acertar "Recusar", que nega o acesso
-    aos certificados e derruba o envio).
+    O CriptoCNS tem pelo menos 2 layouts de diálogo distintos (ver
+    PERFIS_DIALOGO) — por isso primeiro identificamos QUAL perfil bate com
+    o tamanho real da janela, e só então calculamos a coordenada com a
+    fração calibrada DAQUELE perfil. Se nenhum perfil bater, o layout mudou
+    de vez — prefere NÃO clicar (clicar às cegas poderia acertar "Recusar",
+    que nega o acesso/assinatura e derruba o envio) e avisa para recalibrar.
+
+    `marcar_nao_perguntar`: clica no checkbox "Não perguntar novamente" ANTES
+    de "Aceitar" (a ordem importa — marcar depois de fechar o diálogo não
+    tem efeito). Só funciona se o perfil identificado tiver
+    `fracao_nao_perguntar` calibrada; caso contrário loga aviso e segue sem
+    marcar (não é erro fatal, só não elimina o diálogo da próxima vez).
     """
     rect = _rect(hwnd)
-    if not tamanho_plausivel(rect):
+    perfil = _achar_perfil(rect)
+    if perfil is None:
         larg, alt = rect[2] - rect[0], rect[3] - rect[1]
+        esperados = " ou ".join(f"~{w}x{h}" for w, h in
+                                (p["tamanho_esperado"] for p in PERFIS_DIALOGO))
         log(f"   ⚠️ Janela do CriptoCNS com tamanho inesperado ({larg}x{alt}, "
-            f"esperado ~{TAMANHO_ESPERADO[0]}x{TAMANHO_ESPERADO[1]}). "
-            f"NÃO vou clicar às cegas — aceite manualmente e me avise para "
-            f"eu recalibrar.")
+            f"esperado {esperados}). NÃO vou clicar às cegas — aceite "
+            f"manualmente e me avise para eu recalibrar.")
         return False
 
     try:
@@ -370,8 +431,20 @@ def tratar_dialogo_electron(hwnd, log=print):
         # então seguimos — só registramos.
         log("   ℹ️ Não consegui trazer a janela para frente; clicando assim mesmo.")
 
-    x, y = coordenada_aceitar(rect)
-    log(f"   🖱️ Clicando 'Aceitar' em ({x}, {y}) — janela {rect}.")
+    if marcar_nao_perguntar:
+        fracao_chk = perfil.get("fracao_nao_perguntar")
+        if fracao_chk:
+            cx, cy = coordenada_aceitar(rect, fracao=fracao_chk)
+            log(f"   ☑️ Clicando 'Não perguntar novamente' em ({cx}, {cy}).")
+            _clicar_coordenada(cx, cy, log)
+            time.sleep(0.2)
+        else:
+            log("   ℹ️ Este perfil de diálogo ainda não tem o checkbox "
+                "'Não perguntar novamente' calibrado — seguindo sem marcar.")
+
+    x, y = coordenada_aceitar(rect, fracao=perfil["fracao_aceitar"])
+    log(f"   🖱️ Clicando 'Aceitar' em ({x}, {y}) — janela {rect} "
+        f"(perfil {perfil['tamanho_esperado']}).")
     if not _clicar_coordenada(x, y, log):
         return False
 
@@ -407,8 +480,11 @@ def tratar_dialogo(hwnd, filhos, marcar_nao_perguntar=False, log=print):
 
     botao = _achar_filho_por_texto(filhos, TEXTO_ACEITAR)
     if not botao:
-        # Caso normal hoje: Electron, sem botão como HWND. Vai de clique real.
-        return tratar_dialogo_electron(hwnd, log=log)
+        # Caso normal hoje: Electron, sem botão (nem checkbox) como HWND —
+        # o bloco acima nunca encontra `chk` de verdade nesse caso. Repassa
+        # marcar_nao_perguntar para o caminho de clique real, que tem a
+        # fração calibrada do checkbox por perfil de diálogo.
+        return tratar_dialogo_electron(hwnd, marcar_nao_perguntar=marcar_nao_perguntar, log=log)
 
     try:
         # PostMessage (assíncrono): o clique dispara trabalho no processo do

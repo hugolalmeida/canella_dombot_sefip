@@ -504,6 +504,7 @@ class ValidacaoProtocolo:
     def __init__(self, logger=None):
         self.log = logger or (lambda msg: print(msg, flush=True))
         self.main_hwnd = 0
+        self.arquivo_invalido = False
 
     def conectar(self) -> bool:
         janelas = _achar_sefip()
@@ -627,14 +628,43 @@ class ValidacaoProtocolo:
         win32gui.PostMessage(hvalidar, BM_CLICK, 0, 0)
         time.sleep(2)
 
-        # Tela 'GRF' (TfrmGridGuias) com a guia gerada — Visualizar.
+        # Tela 'GRF' (TfrmGridGuias) com a guia gerada — Visualizar. Mas
+        # 'Validar Arquivo' pode falhar com popup 'Erro 1117 - O arquivo
+        # de dados (.SFP) é inválido ou foi violado' — confirmado ao vivo
+        # (2026-08-04) como uma falha REAL de dados do .SFP (não bug do
+        # bot); a orientação da equipe é reprocessar essa competência do
+        # zero (Etapas 1-4 de novo), não adianta tentar de novo aqui. Em
+        # vez de deixar a tela travada esperando o timeout inteiro,
+        # detectamos o popup e retornamos um status distinto para o
+        # chamador tratar como falha ISOLADA dessa rodada, sem abortar as
+        # demais competências do lote.
         t0 = time.time()
         hgrid = 0
+        herro_1117 = 0
         while time.time() - t0 < timeout:
             hgrid = _achar_popup(classes=("TfrmGridGuias",))
             if hgrid:
                 break
+            herro_1117 = _achar_popup(titulos=["erro"])
+            if herro_1117:
+                break
             time.sleep(0.4)
+
+        if herro_1117:
+            partes_erro = []
+            for h in _enum_filhos(herro_1117, lambda h: _cls(h) == "Static"):
+                t = _txt(h)
+                if t:
+                    partes_erro.append(t)
+            texto_erro = " ".join(partes_erro)
+            self.log(f"❌ Popup 'Erro' após Validar Arquivo (provável 1117 — .SFP inválido/violado): "
+                     f"{texto_erro or '(texto não lido)'}")
+            _clicar_botao_por_texto(herro_1117, "OK", assincrono=True)
+            time.sleep(0.5)
+            _clicar_botao_por_texto(hbusca, "Sair", assincrono=True)
+            self.arquivo_invalido = True
+            return False
+
         if not hgrid:
             self.log("❌ Tela de guias (TfrmGridGuias) não apareceu após Validar Arquivo.")
             return False
@@ -1042,7 +1072,13 @@ def main():
                 print("❌ --validar-protocolo requer --xml, --sfp e --pdf-saida.")
                 sys.exit(1)
             if not bot.validar_protocolo_e_gerar_guia(args.xml, args.sfp, args.pdf_saida):
-                sys.exit(1)
+                # Exit code 2 = falha ESPECÍFICA de arquivo .SFP inválido/
+                # violado (Erro 1117) — orientação da equipe é reprocessar
+                # essa competência do zero, não é um bug de automação.
+                # Código distinto permite ao orquestrador (Loop_FGTS.py)
+                # tratar como falha isolada desta rodada, sem abortar as
+                # demais competências do lote.
+                sys.exit(2 if bot.arquivo_invalido else 1)
 
         if args.backup:
             if not args.dir_backup:

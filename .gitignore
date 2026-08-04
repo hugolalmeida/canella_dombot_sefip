@@ -15,5 +15,11 @@ logs/
 # Saídas por empresa: .re/.SFP gerados e protocolos assinados pela Caixa
 # (dados fiscais reais de clientes — CNPJ, folha, selo digital). Nunca versionar.
 results/
+results_teste/
 /0*/
+
+# Certificados digitais (.pfx/.p12) — chave privada de assinatura, nunca
+# versionar mesmo que alguém copie um para dentro do projeto por engano.
+*.pfx
+*.p12
 

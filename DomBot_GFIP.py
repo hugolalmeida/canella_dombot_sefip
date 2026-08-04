@@ -89,6 +89,58 @@ def _forcar_foreground(hwnd) -> bool:
         return False
 
 
+def _achar_janela_por_titulo(titulo_contem: list, hwnd_principal: int = 0) -> int:
+    """
+    Procura uma janela FNWND3190 visível cujo título contenha algum dos
+    termos em `titulo_contem` (case-insensitive) — tanto entre janelas
+    TOP-LEVEL (EnumWindows) quanto entre FILHAS diretas da janela
+    principal do Domínio (EnumChildWindows).
+
+    🔴 Bug encontrado ao vivo (2026-08-04): a janela "Seleção de
+    Empregados" pode existir como FILHA da janela principal do Domínio
+    (GetParent == hwnd do Domínio), visível via EnumChildWindows, sem
+    NUNCA aparecer em EnumWindows. Checagens que usavam só EnumWindows
+    relatavam falsamente "nenhuma janela residual" mesmo com essa janela
+    aberta e bloqueando o F8 da troca de empresa seguinte — o popup
+    "Atenção: para trocar de empresa você terá que fechar todas as
+    janelas abertas" reaparecia em loop porque o Domínio via a janela,
+    mas o bot não.
+    """
+    termos = [t.lower() for t in titulo_contem]
+    achado = [0]
+
+    def _bate(hwnd) -> bool:
+        try:
+            if not win32gui.IsWindowVisible(hwnd):
+                return False
+            if win32gui.GetClassName(hwnd) != "FNWND3190":
+                return False
+            t = win32gui.GetWindowText(hwnd).lower()
+            return any(termo in t for termo in termos)
+        except Exception:
+            return False
+
+    def _cb_top(hwnd, _):
+        if achado[0]:
+            return
+        if _bate(hwnd):
+            achado[0] = hwnd
+    win32gui.EnumWindows(_cb_top, None)
+
+    if not achado[0] and hwnd_principal:
+        def _cb_filho(hwnd, _):
+            if achado[0]:
+                return
+            if _bate(hwnd):
+                achado[0] = hwnd
+        try:
+            win32gui.EnumChildWindows(hwnd_principal, _cb_filho, None)
+        except Exception:
+            pass
+
+    return achado[0]
+
+
 def _hwnd_com_foco_teclado() -> int:
     """
     Retorna o hwnd do controle que realmente possui o foco de teclado no
@@ -815,7 +867,13 @@ class GFIPAutomation:
             if win32gui.IsIconic(hwnd):
                 win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
                 time.sleep(1)
-            win32gui.SetForegroundWindow(hwnd)
+            # _forcar_foreground (AttachThreadInput) em vez de
+            # SetForegroundWindow puro — chamado como subprocesso pelo
+            # Loop_FGTS.py, este processo não está em foreground real,
+            # então SetForegroundWindow cru levanta
+            # "(0, 'SetForegroundWindow', 'No error message is available')"
+            # e a conexão falha antes mesmo de tentar.
+            _forcar_foreground(hwnd)
             time.sleep(0.5)
 
             # Conecta usando win32 sem mapear a árvore inteira (timeout curto)
@@ -931,28 +989,113 @@ class GFIPAutomation:
                 return False
 
             # Aguarda a janela "Troca de empresas" fechar de fato — sinal de
-            # que o Domínio concluiu o carregamento da empresa. Só depois
-            # disso é seguro checar/fechar o aviso de vencimento e navegar
-            # pelo menu; fazer isso cedo demais faz o menu ser processado
-            # ainda com a troca em andamento, e o aviso "rouba" o Enter.
+            # que o Domínio concluiu o carregamento da empresa.
+            #
+            # 🔴 Bug observado ao vivo (2ª rodada de um lote, nunca a 1ª): o
+            # Aviso de Vencimento pode surgir e ficar por trás da "Troca de
+            # empresas" ANTES dela fechar, roubando o foco do ENTER que
+            # acabamos de enviar ao campo de busca — a troca nunca é
+            # confirmada, e o loop abaixo (que só checa a existência da
+            # janela, não se algo está bloqueando por trás) espera os 10s
+            # inteiros à toa. Corrigido tratando avisos/erros DENTRO do
+            # próprio loop de espera, não só depois que ela fechar.
             self.log("⏳ Aguardando o Domínio concluir a troca de empresa...")
             troca_fechou = False
-            for _ in range(20):
+            # Causa raiz do travamento de ~20s corrigida (janela "Seleção
+            # de Empregados" como filha oculta — ver _achar_janela_por_titulo
+            # e Loop_FGTS._fechar_janelas_residuais_dominio). Com isso, a
+            # troca real conclui em poucos segundos; reduzido de 20x0.5s
+            # (10s) para 12x0.3s (3.6s) — ainda com folga, mas sem
+            # desperdiçar tempo no caminho feliz nem no caso de falha real
+            # (que agora é detectada e tratada, não só esperada).
+            for _i_espera in range(12):
                 if self.should_stop():
                     return False
+                avisou = self._fechar_avisos_vencimento()
+                erro_tratado = self._tratar_erros_dominio()
                 try:
                     troca_check = self.main_window.child_window(title="Troca de empresas", class_name="FNWND3190")
                     if not troca_check.exists():
                         troca_fechou = True
                         break
+                    if avisou or erro_tratado:
+                        # O ENTER original pode ter sido roubado pelo aviso
+                        # que acabamos de fechar — reenvia a confirmação no
+                        # campo de busca antes de continuar esperando.
+                        troca_hwnd_retry = troca_check.wrapper_object().handle
+                        edit_retry = win32gui.FindWindowEx(troca_hwnd_retry, 0, "Edit", None)
+                        _forcar_foreground(troca_hwnd_retry)
+                        time.sleep(0.15)
+                        if edit_retry:
+                            edit_obj = self.app.window(handle=edit_retry)
+                            edit_obj.set_focus()
+                            time.sleep(0.1)
+                        send_keys('{ENTER}')
+                        time.sleep(0.2)
                 except Exception:
                     troca_fechou = True
                     break
-                if not self.smart_sleep(0.5):
+                if not self.smart_sleep(0.3):
                     return False
 
             if not troca_fechou:
-                self.log("⚠️ Janela 'Troca de empresas' ainda visível após espera — prosseguindo com cautela")
+                # 🔴 Prosseguir aqui é o que causa o bug observado ao vivo:
+                # o Domínio ainda considera a janela "Troca de empresas"
+                # aberta, então a PRÓXIMA ação (abrir o relatório GFIP)
+                # é recusada com "para trocar de empresa você terá que
+                # fechar todas as janelas abertas" — mesmo já tendo
+                # reportado "Empresa ativa" e seguido em frente. Em vez de
+                # só avisar e continuar, força o fechamento ativamente
+                # (foco + ENTER, já que o campo de busca deve estar com o
+                # número certo digitado) e reconfirma antes de prosseguir.
+                self.log("⚠️ Janela 'Troca de empresas' ainda visível após espera — forçando fechamento")
+                # ENTER já foi enviado uma vez (linha ~927/934) sem fechar a
+                # janela — repetir ENTER às cegas repete o mesmo resultado.
+                # Pode haver um popup de erro por trás (ex.: "empresa já
+                # ativa"/"não encontrada") interceptando o ENTER, então
+                # tratamos popups primeiro; se mesmo assim a janela persistir,
+                # usamos ESC (cancela a troca) em vez de tentar de novo — o
+                # próprio DomBot_GFIP roda de novo do zero na próxima empresa
+                # da fila (novo subprocesso), então cancelar aqui é seguro.
+                fechou_por_conclusao = False
+                fechou_via_esc = False
+                for _tentativa in range(6):
+                    try:
+                        troca_check = self.main_window.child_window(title="Troca de empresas", class_name="FNWND3190")
+                        if not troca_check.exists():
+                            fechou_por_conclusao = True
+                            break
+                        self._tratar_erros_dominio()
+                        self._checar_sem_dados()
+                        troca_check = self.main_window.child_window(title="Troca de empresas", class_name="FNWND3190")
+                        if not troca_check.exists():
+                            fechou_por_conclusao = True
+                            break
+                        troca_hwnd_residual = troca_check.wrapper_object().handle
+                        _forcar_foreground(troca_hwnd_residual)
+                        time.sleep(0.2)
+                        send_keys('{ESC}')
+                        time.sleep(0.5)
+                        if not self.main_window.child_window(
+                                title="Troca de empresas", class_name="FNWND3190").exists():
+                            fechou_via_esc = True
+                            break
+                    except Exception:
+                        fechou_via_esc = True
+                        break
+                if not fechou_por_conclusao and not fechou_via_esc:
+                    self.log("❌ Janela 'Troca de empresas' não fechou mesmo após retry — abortando troca de empresa")
+                    self._enviar_escs(6)
+                    return False
+                if fechou_via_esc:
+                    # ESC CANCELA a troca (não confirma) — a empresa pode não
+                    # ter sido trocada de fato. Reportar sucesso aqui
+                    # repetiria o bug original (seguir em frente com a
+                    # empresa errada ativa). Mais seguro abortar esta rodada;
+                    # o próximo subprocesso da fila recomeça do zero.
+                    self.log("❌ Janela 'Troca de empresas' foi cancelada (ESC) — a troca pode não ter sido confirmada, abortando")
+                    return False
+                self.log("✅ Janela 'Troca de empresas' fechada (troca concluída)")
 
             # Tempo extra para o aviso de vencimento (se houver) terminar de
             # renderizar antes de tentarmos fechá-lo/navegar pelo menu.
@@ -968,8 +1111,13 @@ class GFIPAutomation:
             self._enviar_escs(8)
             return False
 
-    def _fechar_avisos_vencimento(self):
-        """Fecha popup de Avisos de Vencimento — busca como filho e como top-level."""
+    def _fechar_avisos_vencimento(self) -> bool:
+        """
+        Fecha popup de Avisos de Vencimento — busca como filho e como
+        top-level. Retorna True se fechou algo (o chamador usa isso para
+        saber se precisa reenviar uma tecla que o popup possa ter roubado
+        — ver trocar_empresa).
+        """
         fechou = False
 
         # 1. Tenta como filho da janela principal (título real observado:
@@ -986,7 +1134,7 @@ class GFIPAutomation:
             pass
 
         if fechou:
-            return
+            return True
 
         # 2. Tenta como janela top-level via win32gui
         def _cb(hwnd, _):
@@ -1000,7 +1148,7 @@ class GFIPAutomation:
                 classe = win32gui.GetClassName(hwnd)
                 if "Aviso" in titulo and "FNWND" in classe:
                     self.log(f"🔔 Fechando Avisos de Vencimento (top-level: '{titulo}')")
-                    win32gui.SetForegroundWindow(hwnd)
+                    _forcar_foreground(hwnd)
                     time.sleep(0.3)
                     send_keys('{ESC}')
                     time.sleep(0.5)
@@ -1025,7 +1173,7 @@ class GFIPAutomation:
                     titulo = win32gui.GetWindowText(hwnd)
                     if "FNWND" in classe and titulo:
                         self.log(f"🔔 Fechando popup: '{titulo}' [{classe}]")
-                        win32gui.SetForegroundWindow(hwnd)
+                        _forcar_foreground(hwnd)
                         time.sleep(0.3)
                         send_keys('{ESC}')
                         time.sleep(0.5)
@@ -1036,6 +1184,7 @@ class GFIPAutomation:
 
         if not fechou:
             self.log("ℹ️ Nenhum popup de aviso encontrado")
+        return fechou
 
     def _fechar_popup_erro_gravacao(self) -> bool:
         """
@@ -1637,7 +1786,8 @@ class GFIPAutomation:
 
     def salvar_gfip(self, empresa_num: str, empresa_nome: str, dir_saida: str,
                     comp_inicial: str, comp_final: str, cod_recolhimento: str,
-                    data_atraso: str = None, responsavel: str = "1") -> bool:
+                    data_atraso: str = None, responsavel: str = "1",
+                    subpasta: str = None) -> bool:
         """
         Abre a janela do GFIP, preenche os campos e confirma. O Domínio grava
         o arquivo diretamente na pasta informada, com nome de arquivo fixo
@@ -1652,14 +1802,23 @@ class GFIPAutomation:
         Quando comp_inicial != comp_final (extração de um intervalo), usa
         {MM-AAAA_inicial}_a_{MM-AAAA_final} como nome da subpasta.
 
+        `subpasta`: se informado, é inserida entre empresa e competência —
+        {dir_saida}/{empresa_num}/{subpasta}/{MM-AAAA}/. Usado para separar
+        por FUNCIONÁRIO quando a mesma empresa/competência é processada
+        várias vezes (um funcionário por rodada) — sem isso, rodadas de
+        funcionários diferentes na mesma competência se sobrescreveriam.
+
         `data_atraso`: ver preencher_gfip — marca "Em Atraso" no indicador do
         FGTS com essa data, para o fluxo de recálculo de FGTS.
         `responsavel`: ver preencher_gfip — precisa bater com o CNPJ do
         certificado usado na Conectividade Social.
         """
         try:
-            pasta_empresa = os.path.join(
-                dir_saida, empresa_num, _nome_pasta_competencia(comp_inicial, comp_final))
+            partes = [dir_saida, empresa_num]
+            if subpasta:
+                partes.append(subpasta)
+            partes.append(_nome_pasta_competencia(comp_inicial, comp_final))
+            pasta_empresa = os.path.join(*partes)
             os.makedirs(pasta_empresa, exist_ok=True)
 
             resultado = self.preencher_gfip(comp_inicial, comp_final, cod_recolhimento,
@@ -1687,24 +1846,14 @@ class GFIPAutomation:
 
                 fechou_algo = False
 
-                def _cb_selecao(hwnd, _):
-                    nonlocal fechou_algo
-                    try:
-                        if not win32gui.IsWindowVisible(hwnd):
-                            return
-                        t = win32gui.GetWindowText(hwnd).lower()
-                        if "seleção" in t or "selecao" in t:
-                            win32gui.SetForegroundWindow(hwnd)
-                            time.sleep(0.15)
-                            send_keys('{ESC}')
-                            time.sleep(0.3)
-                            fechou_algo = True
-                    except Exception:
-                        pass
-                try:
-                    win32gui.EnumWindows(_cb_selecao, None)
-                except Exception:
-                    pass
+                h_selecao = _achar_janela_por_titulo(
+                    ["seleção", "selecao"], self.main_window.handle)
+                if h_selecao:
+                    _forcar_foreground(h_selecao)
+                    time.sleep(0.15)
+                    send_keys('{ESC}')
+                    time.sleep(0.3)
+                    fechou_algo = True
 
                 self._fechar_avisos_vencimento()
                 self._tratar_erros_dominio()
@@ -1751,17 +1900,8 @@ class GFIPAutomation:
             # REAL de fechamento (não confiar num único ESC às cegas).
             time.sleep(2)
             for _tentativa in range(5):
-                hselecao_residual = 0
-                def _cb_selecao_final(hwnd, _):
-                    nonlocal hselecao_residual
-                    try:
-                        if win32gui.IsWindowVisible(hwnd):
-                            t = win32gui.GetWindowText(hwnd).lower()
-                            if "seleção" in t or "selecao" in t:
-                                hselecao_residual = hwnd
-                    except Exception:
-                        pass
-                win32gui.EnumWindows(_cb_selecao_final, None)
+                hselecao_residual = _achar_janela_por_titulo(
+                    ["seleção", "selecao"], self.main_window.handle)
                 if not hselecao_residual:
                     break
                 self.log(f"🔻 Janela 'Seleção de Empregados' ainda aberta (tentativa "
@@ -1801,29 +1941,14 @@ class GFIPAutomation:
         # ESCs genéricos da janela principal, que nem sempre alcançam quem
         # está atrás.
         for _t in range(5):
-            fechou_selecao = False
-            def _cb_selecao(hwnd, _):
-                nonlocal fechou_selecao
-                if fechou_selecao:
-                    return
-                try:
-                    if not win32gui.IsWindowVisible(hwnd):
-                        return
-                    if "seleção" in win32gui.GetWindowText(hwnd).lower() or "selecao" in win32gui.GetWindowText(hwnd).lower():
-                        self.log(f"🔻 Fechando janela 'Seleção' ainda aberta: '{win32gui.GetWindowText(hwnd)}'")
-                        _forcar_foreground(hwnd)
-                        time.sleep(0.2)
-                        send_keys('{ESC}')
-                        time.sleep(0.4)
-                        fechou_selecao = True
-                except Exception:
-                    pass
-            try:
-                win32gui.EnumWindows(_cb_selecao, None)
-            except Exception:
-                pass
-            if not fechou_selecao:
+            h_selecao = _achar_janela_por_titulo(["seleção", "selecao"], hwnd_main)
+            if not h_selecao:
                 break
+            self.log(f"🔻 Fechando janela 'Seleção' ainda aberta: '{win32gui.GetWindowText(h_selecao)}'")
+            _forcar_foreground(h_selecao)
+            time.sleep(0.2)
+            send_keys('{ESC}')
+            time.sleep(0.4)
 
         # 2. Fecha a janela do GFIP explicitamente via pywinauto (mais confiável)
         for _t in range(5):
@@ -1841,11 +1966,8 @@ class GFIPAutomation:
             break
 
         # 2. ESC incondicional na janela principal para fechar relatório embutido e outras abas
-        try:
-            win32gui.SetForegroundWindow(hwnd_main)
-            time.sleep(0.2)
-        except Exception:
-            pass
+        _forcar_foreground(hwnd_main)
+        time.sleep(0.2)
         for _ in range(10):
             send_keys('{ESC}')
             time.sleep(0.12)
@@ -1861,14 +1983,11 @@ class GFIPAutomation:
 
             if "[" in titulo:
                 self.log(f"🔻 Fechando aba embutida: {titulo[:60]}")
-                try:
-                    win32gui.SetForegroundWindow(hwnd_main)
-                    time.sleep(0.15)
-                    for _ in range(6):
-                        send_keys('{ESC}')
-                        time.sleep(0.12)
-                except Exception:
-                    pass
+                _forcar_foreground(hwnd_main)
+                time.sleep(0.15)
+                for _ in range(6):
+                    send_keys('{ESC}')
+                    time.sleep(0.12)
                 self._tratar_erros_dominio()
                 time.sleep(0.4)
                 continue
@@ -1892,12 +2011,9 @@ class GFIPAutomation:
             if janela_flutuante[0]:
                 hwnd_f, titulo_f = janela_flutuante[0]
                 self.log(f"🔻 Fechando janela flutuante: '{titulo_f}'")
-                try:
-                    win32gui.SetForegroundWindow(hwnd_f)
-                    time.sleep(0.15)
-                    send_keys('{ESC}')
-                except Exception:
-                    pass
+                _forcar_foreground(hwnd_f)
+                time.sleep(0.15)
+                send_keys('{ESC}')
                 time.sleep(0.4)
                 continue
 
@@ -1910,10 +2026,7 @@ class GFIPAutomation:
             time.sleep(0.2)
 
         # Garante foco de volta na janela principal
-        try:
-            win32gui.SetForegroundWindow(hwnd_main)
-        except Exception:
-            pass
+        _forcar_foreground(hwnd_main)
 
     def _checar_bloqueio_honorarios(self) -> bool:
         """
@@ -2255,7 +2368,8 @@ class GFIPAutomation:
     def processar_empresa(self, empresa_num: str, empresa_nome: str,
                           comp_inicial: str, comp_final: str,
                           cod_recolhimento: str, dir_saida: str,
-                          data_atraso: str = None, responsavel: str = "1"):
+                          data_atraso: str = None, responsavel: str = "1",
+                          subpasta: str = None):
         """
         Retorna:
           True         — GFIP gerado e TXT salvo
@@ -2276,13 +2390,7 @@ class GFIPAutomation:
                     return False
 
             hwnd = self.main_window.handle
-            try:
-                if win32gui.IsIconic(hwnd):
-                    win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-                    time.sleep(0.5)
-                win32gui.SetForegroundWindow(hwnd)
-            except Exception:
-                pass
+            _forcar_foreground(hwnd)
             time.sleep(0.2)
 
             # Limpa janelas/abas remanescentes de empresa anterior que falhou
@@ -2315,7 +2423,8 @@ class GFIPAutomation:
             # 3. Preenche campos, confirma e salva o TXT direto na subpasta da empresa
             resultado = self.salvar_gfip(empresa_num, empresa_nome, dir_saida,
                                          comp_inicial, comp_final, cod_recolhimento,
-                                         data_atraso=data_atraso, responsavel=responsavel)
+                                         data_atraso=data_atraso, responsavel=responsavel,
+                                         subpasta=subpasta)
             if resultado is None:
                 self.log(f"⏭️ {empresa_nome} ignorada: sem dados para emitir no período")
                 time.sleep(0.5)
@@ -2416,6 +2525,7 @@ def run_cli(args):
     dir_saida = args.dir_saida or os.path.join(os.path.dirname(__file__), "results")
     data_atraso = args.data_atraso or None
     responsavel = args.responsavel or "1"
+    subpasta = getattr(args, "subpasta", None) or None
 
     os.makedirs(dir_saida, exist_ok=True)
 
@@ -2432,7 +2542,7 @@ def run_cli(args):
 
     ok = bot.processar_empresa(str(empresa_num), empresa_nome, comp_inicial, comp_final,
                                cod_recolhimento, dir_saida, data_atraso=data_atraso,
-                               responsavel=responsavel)
+                               responsavel=responsavel, subpasta=subpasta)
 
     if ok:
         _emit("sucesso", f"Empresa {empresa_num} concluída com sucesso", empresa_num)
@@ -2582,6 +2692,11 @@ def main():
                              "PRECISA bater com o CNPJ do certificado usado depois na Conectividade "
                              "Social — testado na prática: valor errado gera .SFP recusado com "
                              "'inscrição do responsável diferente da empresa logada'. Padrão: '1'.")
+    parser.add_argument("--subpasta", dest="subpasta",
+                        help="Se informado, insere essa subpasta entre empresa e competência: "
+                             "{dir-saida}/{empresa}/{subpasta}/{MM-AAAA}/ — usado para separar por "
+                             "FUNCIONÁRIO quando a mesma empresa/competência é processada em várias "
+                             "rodadas (uma por funcionário).")
     args = parser.parse_args()
 
     if args.worker:

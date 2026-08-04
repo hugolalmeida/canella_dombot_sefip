@@ -86,6 +86,25 @@ USER_DATA_DIR = r"C:\Users\Canella e Santos\AppData\Local\Temp\claude_conectivid
 # quando --confirmar-envio NÃO é informado.
 TIMEOUT_REVISAO_PADRAO = 3600
 
+# 🔴 Certificado digital A1 injetado DIRETO no contexto do navegador via
+# client_certificates do Playwright — testado em 2026-08-04 depois de
+# confirmar que --auto-select-certificate-for-urls (flag de linha de
+# comando do Chromium) NÃO funciona neste site: a Conectividade Social não
+# usa o handshake TLS mútuo padrão que essa flag intercepta (o popup nativo
+# do Windows nunca chegava a aparecer nem a ser resolvido, e a página
+# travava esperando "Nova Mensagem" pelos 90s inteiros).
+# client_certificates funciona em outra camada (o próprio Chromium assina o
+# desafio com a chave do .pfx, sem depender do CryptoAPI do Windows nem de
+# qualquer popup) — mais confiável para automação sem supervisão.
+# Arquivo fica FORA do repositório (pasta de rede dedicada a certificados,
+# nunca dentro do projeto) — client_certificates lê o .pfx diretamente,
+# sem precisar instalar o certificado no Windows.
+CERTIFICADO_PFX_PATH = (
+    r"Z:\003 - CERTIFICADO DIGITAL\102 - CANELLA E SANTOS"
+    r"\CANELLA & SANTOS CONTABILIDADE LTDA   SENHA 12345678  V 23.02.2027.pfx"
+)
+CERTIFICADO_PFX_SENHA = "12345678"
+
 # Subpasta criada DENTRO da pasta do .SFP para receber os artefatos do envio
 # (retorno, comprovante PDF e protocolo.json). Mantém tudo da empresa junto:
 #   results/404/MD9ghVk735n00008.SFP
@@ -838,6 +857,16 @@ def enviar_arquivo_sefip(arquivo: str, nome_mensagem: str, estado: str,
             page = context.new_page()
         else:
             navegador = None
+            client_certificates = None
+            if os.path.exists(CERTIFICADO_PFX_PATH):
+                client_certificates = [{
+                    "origin": "https://conectividadesocialv2.caixa.gov.br",
+                    "pfxPath": CERTIFICADO_PFX_PATH,
+                    "passphrase": CERTIFICADO_PFX_SENHA,
+                }]
+            else:
+                log(f"⚠️ Certificado não encontrado em '{CERTIFICADO_PFX_PATH}' — "
+                    "seguindo sem client_certificates (pode pedir seleção manual).")
             context = p.chromium.launch_persistent_context(
                 USER_DATA_DIR,
                 channel="chrome",
@@ -845,6 +874,7 @@ def enviar_arquivo_sefip(arquivo: str, nome_mensagem: str, estado: str,
                 accept_downloads=True,
                 viewport={"width": 1400, "height": 900},
                 args=[f"--auto-select-certificate-for-urls=[{politica_certificado}]"],
+                client_certificates=client_certificates,
             )
             page = context.pages[0] if context.pages else context.new_page()
         rastro.anexar(context, page)

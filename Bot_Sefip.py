@@ -44,12 +44,18 @@ from datetime import datetime
 import win32api
 import win32con
 import win32gui
+import win32process
 from pywinauto.keyboard import send_keys
 
 try:
     from pypdf import PdfReader
 except ImportError:
     PdfReader = None
+
+try:
+    from Bot_Sefip_Protocolo import ValidacaoProtocolo
+except ImportError:
+    ValidacaoProtocolo = None
 
 
 def _esta_elevado() -> bool:
@@ -219,10 +225,29 @@ class SefipAutomation:
             if owner and win32gui.IsIconic(owner):
                 win32gui.ShowWindow(owner, win32con.SW_RESTORE)
                 time.sleep(0.3)
-            win32gui.SetForegroundWindow(hwnd)
-            time.sleep(0.3)
+        except Exception:
+            pass
+        # SetForegroundWindow cru falha silenciosamente (ou levanta
+        # "No error message is available") quando este processo não está
+        # em foreground real — sempre o caso quando rodado como subprocess
+        # pelo Loop_FGTS.py/Orquestrador_FGTS.py. AttachThreadInput contorna
+        # a "focus stealing prevention" do Windows (mesmo padrão já usado em
+        # DomBot_GFIP._forcar_foreground e Bot_Sefip_Protocolo._forcar_foreground).
+        try:
+            tid_atual = win32api.GetCurrentThreadId()
+            tid_alvo, _ = win32process.GetWindowThreadProcessId(hwnd)
+            anexado = False
+            if tid_alvo != tid_atual:
+                win32process.AttachThreadInput(tid_atual, tid_alvo, True)
+                anexado = True
+            try:
+                win32gui.SetForegroundWindow(hwnd)
+            finally:
+                if anexado:
+                    win32process.AttachThreadInput(tid_atual, tid_alvo, False)
         except Exception as e:
             self.log.warning(f"⚠️ SetForegroundWindow falhou (rodando como Admin?): {e}")
+        time.sleep(0.3)
 
     # ── Clique/foco de controles ─────────────────────────────────────────────
 
@@ -394,9 +419,20 @@ class SefipAutomation:
         time.sleep(1)
 
         # 3. Popup de sobreposição — confirma SIM
+        #
+        # 🔴 Timeout reduzido: esse popup só aparece se a empresa/competência
+        # JÁ tinha dados anteriores para sobrescrever — em uma 1ª importação
+        # (caso comum ao processar competências novas em lote) ele nunca
+        # aparece, e o loop antigo esperava os `timeout` segundos INTEIROS
+        # (60s por padrão) só para desistir e seguir — gasto observado ao
+        # vivo (~1min por rodada nesse ponto). Um teto de 8s é suficiente
+        # margem para o popup real aparecer (ele surge quase imediato após
+        # o clique em Abrir) sem penalizar o caso comum de "não tinha nada
+        # a sobrescrever".
+        timeout_sobreposicao = min(timeout, 8)
         t0 = time.time()
         confirmou_sobreposicao = False
-        while time.time() - t0 < timeout:
+        while time.time() - t0 < timeout_sobreposicao:
             hpopup = self._achar_popup(
                 titulos=["informação", "informacao"],
                 classes=("TMessageForm", "TfrmExibeMsg", "#32770"),
@@ -408,9 +444,9 @@ class SefipAutomation:
                     self.log.info("🔔 Popup de sobreposição detectado — confirmando Sim")
                     self._clicar_no_popup(hpopup, "Sim")
                     confirmou_sobreposicao = True
-                    time.sleep(1)
+                    time.sleep(0.5)
                     break
-            time.sleep(0.4)
+            time.sleep(0.25)
 
         if not confirmou_sobreposicao:
             self.log.warning("⚠️ Popup de sobreposição não apareceu (pode ser 1ª importação "
@@ -1234,6 +1270,30 @@ def run_teste(args):
             sys.exit(1)
         bot.log.info(f"✅ Etapa 4 concluída — arquivo final: {destino}")
 
+        # Backup logo após o Executar desta rodada — 'Ferramentas > Fazer
+        # backup' captura a base INTEIRA carregada no momento no SEFIP,
+        # não algo específico da competência; se ficasse para rodar só no
+        # final de um lote (ex.: Loop_FGTS.py processando várias
+        # competências em sequência), o Import da rodada seguinte
+        # sobrescreveria a base antes do backup rodar, perdendo o estado
+        # já processado. NOTA: a ordem do backup NÃO é a causa do "Erro
+        # 1117" (hipótese testada e descartada em 2026-08-04) — a causa
+        # real é o campo Nome do diálogo da Etapa 6 ter limite de ~120
+        # caracteres; use um --dir-raiz curto (ex.: "C:\FGTS") no
+        # Loop_FGTS.py para evitar o erro independente da ordem do backup.
+        if args.dir_backup:
+            if ValidacaoProtocolo is None:
+                bot.log.error("❌ --dir-backup pedido mas Bot_Sefip_Protocolo.py não pôde ser "
+                              "importado (ValidacaoProtocolo indisponível) — backup NÃO foi feito.")
+                sys.exit(1)
+            bot.log.info("💾 Fazendo backup da base (Ferramentas > Fazer backup)...")
+            validador = ValidacaoProtocolo(logger=lambda m: bot.log.info(m))
+            validador.main_hwnd = bot.main_hwnd
+            if not validador.fazer_backup(args.dir_backup):
+                bot.log.error("❌ Falha ao fazer backup — confira a tela do SEFIP manualmente.")
+                sys.exit(1)
+            bot.log.info(f"✅ Backup concluído: {args.dir_backup}")
+
     bot.log.info("🏁 Fluxo de teste concluído.")
 
 
@@ -1257,6 +1317,12 @@ def main():
     p.add_argument("--salvar", action="store_true", help="Clicar Salvar ao fim da Etapa 3 (GRAVA de verdade)")
     p.add_argument("--dir-saida", dest="dir_saida",
                    help="Pasta final para onde mover o arquivo .SFP gerado (Etapa 4)")
+    p.add_argument("--dir-backup", dest="dir_backup",
+                   help="[Etapa 4] Se informado, faz 'Ferramentas > Fazer backup' logo após o "
+                        "Executar desta competência (antes do próximo Import sobrescrever a "
+                        "base) — necessário em lotes de várias competências, já que o backup "
+                        "captura a base inteira carregada no momento, não algo específico da "
+                        "competência.")
     p.add_argument("--tudo", action="store_true", help="Atalho: liga etapa1+etapa2+etapa3+etapa4")
     args = p.parse_args()
 
